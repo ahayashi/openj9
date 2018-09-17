@@ -1573,7 +1573,8 @@ bool TR_SPMDKernelParallelizer::visitNodeToMapSymbols(TR::Node *node,
                                                       TR_RegionStructure *loop,
                                                       TR_PrimaryInductionVariable *piv,
                                                       int32_t lineNumber,
-                                                      int32_t visitCount)
+                                                      int32_t visitCount,
+                                                      TR_SPMDReductionInfo* reductionInfo)
    {
 
    bool is_parent_nullcheck = false;
@@ -1639,11 +1640,29 @@ bool TR_SPMDKernelParallelizer::visitNodeToMapSymbols(TR::Node *node,
             if (!comp()->cg()->_gpuSymbolMap[hostSymRef->getReferenceNumber()]._hostSymRef)
                {
                traceMsg(comp(), "Adding node %p into auto list\n", node);
-
-               autos.add((TR::AutomaticSymbol *)hostSymRef->getSymbol());
-
-               gpuMapElement element(node, hostSymRef, -1, -1);
-               comp()->cg()->_gpuSymbolMap[hostSymRef->getReferenceNumber()] = element;
+	       // reduction var
+	       if (reductionInfo != NULL) {
+		   traceMsg(comp(), "Adding node %p into parm list since it's a reduction var\n", node);
+		   int32_t elementSize = -1;
+		   switch (node->getDataType()) {
+		   case TR::Int32:
+		   case TR::Float:
+		       elementSize = 4;
+		       break;
+		   case TR::Int64:
+		   case TR::Double:
+		       elementSize = 8;
+		   }
+		   // make the reduction variable a parameter
+		   convertIntoParm(node, elementSize, parms);
+		   comp()->cg()->_gpuSymbolMap[hostSymRef->getReferenceNumber()]._isReductionVar = true;
+		   comp()->cg()->_gpuSymbolMap[hostSymRef->getReferenceNumber()]._reductionSymRef = comp()->getSymRefTab()->createTemporary(comp()->getMethodSymbol(), TR::Address);
+	       } else {
+		   traceMsg(comp(), "Adding node %p into auto list\n", node);
+		   autos.add((TR::AutomaticSymbol *)hostSymRef->getSymbol());
+		   gpuMapElement element(node, hostSymRef, -1, -1);
+		   comp()->cg()->_gpuSymbolMap[hostSymRef->getReferenceNumber()] = element;
+	       }
                }
             }
          }
@@ -1695,7 +1714,7 @@ bool TR_SPMDKernelParallelizer::visitNodeToMapSymbols(TR::Node *node,
 
    for (int32_t i = 0; i < node->getNumChildren(); i++)
       {
-      if (!visitNodeToMapSymbols(node->getChild(i), parms, autos, loop, piv, lineNumber, visitCount))
+      if (!visitNodeToMapSymbols(node->getChild(i), parms, autos, loop, piv, lineNumber, visitCount, reductionInfo))
          return false;
       }
 
@@ -2073,9 +2092,11 @@ void TR_SPMDKernelParallelizer::generateGPUParmsBlock(TR::SymbolReference *alloc
 
          populateParmsNode = TR::Node::createWithSymRef(firstNode, TR::astorei, 2, arrayShadowSymRef);
          populateParmsNode->setAndIncChild(0, parmLocationNode); //address to store GPU parameter in
-         populateParmsNode->setAndIncChild(1, TR::Node::createWithSymRef(firstNode, TR::loadaddr, 0, hostSymRef)); //GPU parameter to store
-         populateParmsBlock->append(TR::TreeTop::create(comp(), populateParmsNode));
-         continue;
+	 if (!gpuSymbolMap[nc]._isReductionVar) {
+	     populateParmsNode->setAndIncChild(1, TR::Node::createWithSymRef(firstNode, TR::loadaddr, 0, hostSymRef)); //GPU parameter to store
+	     populateParmsBlock->append(TR::TreeTop::create(comp(), populateParmsNode));
+	     continue;
+	 }
          }
 
       parmLocationNode = TR::Node::create(firstNode, TR::aladd, 2);
@@ -2394,12 +2415,90 @@ void TR_SPMDKernelParallelizer::insertGPUCopyToSequence(TR::Node *firstNode, TR:
       int32_t parmSlot = gpuSymbolMap[nc]._parmSlot;
       int32_t elementSize = gpuSymbolMap[nc]._elementSize;
       bool hoistAccess = gpuSymbolMap[nc]._hoistAccess;
+      bool isReductionVar = gpuSymbolMap[nc]._isReductionVar;
 
       if (!hostSymRef) continue;
       if (parmSlot == -1) continue;
 
       hostSymRef = gpuSymbolMap[nc]._hostSymRefTemp;
-      if (!hostSymRef->getSymbol()->getType().isAddress()) continue;
+      if (!hostSymRef->getSymbol()->getType().isAddress()) {
+	  if (isReductionVar) {
+	      TR::SymbolReference *tmp = gpuSymbolMap[nc]._reductionSymRef;
+	      traceMsg(comp(), "Akihiro reductionSymRef #%d\n", tmp->getReferenceNumber());
+	      int32_t typeNo;
+	      switch (node->getDataType()) {
+	      case TR::Float:
+		  typeNo = 6;
+		  break;
+	      case TR::Double:
+		  typeNo = 7;
+		  break;
+	      case TR::Int32:
+		  typeNo = 10;
+		  break;
+	      case TR::Int64:
+		  typeNo = 11;
+		  break;
+	      default:
+		  typeNo = 10;
+	      }
+	      // jitNewArray
+	      TR::Node *jitNewArray = TR::Node::createWithSymRef(TR::newarray, 2, 2,  TR::Node::create(firstNode, TR::iconst, 0, 1), TR::Node::create(firstNode, TR::iconst, 0, typeNo), comp()->getSymRefTab()->findOrCreateNewArraySymbolRef(comp()->getMethodSymbol()));
+	      TR::TreeTop *jitNewArrayTree = TR::TreeTop::create(comp(), TR::Node::create(TR::treetop, 1, jitNewArray));
+	      copyToGPUBlock->append(jitNewArrayTree);
+	      // allocation Fence
+	      copyToGPUBlock->append(TR::TreeTop::create(comp(), TR::Node::createAllocationFence(NULL, jitNewArray)));
+	      //
+	      copyToGPUBlock->append(TR::TreeTop::create(comp(), TR::Node::createStore(tmp, jitNewArray)));
+
+	      // Store newarray[0] <- hostSymRef;
+	      TR::Node *addrNode = TR::Node::create(firstNode, TR::aladd, 2);
+	      addrNode->setAndIncChild(0, jitNewArray);
+	      addrNode->setAndIncChild(1, TR::Node::create(firstNode, TR::lconst, 0, 8));
+
+	      TR::SymbolReference *arrayShadowSymRef = comp()->getSymRefTab()->findOrCreateArrayShadowSymbolRef(TR::Int64, NULL);
+	      TR::Node *storeNode = TR::Node::create(TR::lstorei, 2, firstNode);
+	      storeNode->setSymbolReference(arrayShadowSymRef);
+	      storeNode->setAndIncChild(0, addrNode);
+	      storeNode->setAndIncChild(1, TR::Node::createLoad(hostSymRef));
+	      TR::TreeTop *initTree = TR::TreeTop::create(comp(), TR::Node::create(TR::treetop, 1, storeNode));
+	      copyToGPUBlock->append(initTree);
+
+	      TR::Node *copyToGPUNode = TR::Node::create(firstNode, addressCallOpCode, 10);
+
+	      helper = comp()->getSymRefTab()->findOrCreateRuntimeHelper(TR_copyToGPU, false, false, false);
+	      helper->getSymbol()->castToMethodSymbol()->setLinkage(_helperLinkage);
+	      copyToGPUNode->setSymbolReference(helper);
+
+	      // *cudaInfo
+	      copyToGPUNode->setAndIncChild(0, TR::Node::createWithSymRef(firstNode, addressLoadOpCode, 0, scopeSymRef));
+
+	      // **hostRef
+	      //copyToGPUNode->setAndIncChild(1, TR::Node::createWithSymRef(firstNode, TR::loadaddr, 0, hostSymRef));
+	      copyToGPUNode->setAndIncChild(1, TR::Node::createWithSymRef(firstNode, TR::loadaddr, 0, tmp));
+
+	      // elementSize
+	      copyToGPUNode->setAndIncChild(2, TR::Node::create(firstNode, TR::iconst, 0, elementSize));
+
+	      // accessMode
+	      copyToGPUNode->setAndIncChild(3, TR::Node::create(firstNode, TR::iconst, 0, gpuSymbolMap[nc]._accessKind & TR::CodeGenerator::ReadWriteAccesses));
+
+	      copyToGPUNode->setAndIncChild(4, TR::Node::create(firstNode, TR::iconst, 0, 0));
+	      copyToGPUNode->setAndIncChild(5, TR::Node::create(firstNode, TR::iconst, 0, 0));
+
+	      TR::Node *aconst0Node = TR::Node::createAddressNode(firstNode, TR::aconst, 0);
+	      copyToGPUNode->setAndIncChild(6, aconst0Node);
+	      copyToGPUNode->setAndIncChild(7, aconst0Node);
+	      copyToGPUNode->setAndIncChild(8, aconst0Node);
+	      copyToGPUNode->setAndIncChild(9, aconst0Node);
+
+	      TR::TreeTop *copyToGPUTreeTop = TR::TreeTop::create(comp(), TR::Node::create(TR::treetop, 1, copyToGPUNode));
+	      copyToGPUBlock->append(copyToGPUTreeTop);
+
+	      TR::TreeTop::create(comp(), copyToGPUTreeTop, TR::Node::createStore(tempDevicePtr, copyToGPUNode));
+	  }
+	  continue;
+      }
 
       bool useLoopBoundsHtoD = (gpuSymbolMap[nc]._rhsAddrExpr && gpuSymbolMap[nc]._rhsAddrExpr != INVALID_ADDR);
       bool useLoopBoundsDtoH = (gpuSymbolMap[nc]._lhsAddrExpr && gpuSymbolMap[nc]._lhsAddrExpr != INVALID_ADDR);
@@ -2664,6 +2763,7 @@ void TR_SPMDKernelParallelizer::insertGPUTemporariesLivenessCode(List<TR::TreeTo
          TR::SymbolReference *hostSymRef = gpuSymbolMap[nc]._hostSymRef;
          TR::SymbolReference *devSymRef = gpuSymbolMap[nc]._devSymRef;
          int32_t parmSlot = gpuSymbolMap[nc]._parmSlot;
+	 bool isReductionVar = gpuSymbolMap[nc]._isReductionVar;
 
          if (!hostSymRef) continue;
          if (parmSlot == -1) continue;
@@ -2672,7 +2772,7 @@ void TR_SPMDKernelParallelizer::insertGPUTemporariesLivenessCode(List<TR::TreeTo
 
          currentNode = TR::Node::create(TR::ladd, 2, TR::Node::create(TR::a2l, 1, TR::Node::createWithSymRef(insertionPoint->getNode(), TR::loadaddr, 0, hostSymRef)), currentNode);
 
-         if (!hostSymRef->getSymbol()->getType().isAddress()) continue;
+	  if (!hostSymRef->getSymbol()->getType().isAddress() && !isReductionVar) continue;
 
          currentNode = TR::Node::create(TR::ladd, 2, TR::Node::create(TR::a2l, 1, TR::Node::createWithSymRef(insertionPoint->getNode(), TR::loadaddr, 0, devSymRef)), currentNode);
          }
@@ -2725,7 +2825,37 @@ void TR_SPMDKernelParallelizer::insertGPURegionExits(List<TR::Block>* exitBlocks
 
       insertionPoint->insertAfter(initTreeTop);
       exitPointsList->add(initTreeTop);
+
+      // Copy the computed reduction variable back to the original scalar variable 
+      CS2::ArrayOf<gpuMapElement, TR::Allocator> &gpuSymbolMap = comp()->cg()->_gpuSymbolMap;
+      CS2::ArrayOf<gpuMapElement, TR::Allocator>::Cursor nc(gpuSymbolMap);
+      for (nc.SetToFirst(); nc.Valid(); nc.SetToNext()) {
+	  bool isReductionVar = gpuSymbolMap[nc]._isReductionVar;
+	  TR::SymbolReference *reductionSymRef = gpuSymbolMap[nc]._reductionSymRef;
+	  if (isReductionVar) {
+	      traceMsg(comp(), "Akihiro reductionSymRef (regionexit) #%d\n", reductionSymRef->getReferenceNumber());
+	      // lstorei
+	      //   aladd
+	      //     aload
+	      //     16
+	      //   lloadi
+	      // aladd
+	      //  aload
+	      //  16
+	      TR::Node *addrNode = TR::Node::create(treetopNode, TR::aladd, 2);
+	      addrNode->setAndIncChild(0, TR::Node::createLoad(reductionSymRef));
+	      addrNode->setAndIncChild(1, TR::Node::create(treetopNode, TR::lconst, 0, 8));;
+	      // lload i
+//            TR::Node * decimalload = TR::Node::create(loadOp, 1, decimalAddressNode);
+//           decimalload->setSymbolReference(symRef);
+//           decimalload->setDecimalPrecision(prec);
+	      TR::SymbolReference *arrayShadowSymRef = comp()->getSymRefTab()->findOrCreateArrayShadowSymbolRef(TR::Int64, NULL);
+	      TR::Node *loaded = TR::Node::create(TR::lloadi, 1, addrNode);
+	      loaded->setSymbolReference(arrayShadowSymRef);
+	      exitBlock->append(TR::TreeTop::create(comp(), TR::Node::createStore(gpuSymbolMap[nc]._hostSymRef, loaded)));
+	  }
       }
+     }
    }
 
 
@@ -2858,7 +2988,7 @@ bool TR_SPMDKernelParallelizer::estimateGPUCost(TR_RegionStructure *loop, TR::Bl
    return addRegionCost(loop, loop, estimateBlock, lambdaCost);
    }
 
-bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMDScopeInfo* gpuScope)
+bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMDScopeInfo* gpuScope, TR_HashTab* reductionOperationsHashTab)
    {
    _verboseTrace = 0;
    if (comp()->getOptions()->getEnableGPU(TR_EnableGPUVerbose)) _verboseTrace = 1;
@@ -2878,6 +3008,12 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
    TR::Node *firstNode = firstTree->getNode();
 
    TR::Block *loopInvariantBlock = findLoopInvariantBlock(comp(), loop);
+
+   TR_HashId id = 0;
+   TR_HashTab* reductionHashTab = NULL;
+   if (reductionOperationsHashTab->locate(loop, id)) {
+       reductionHashTab = (TR_HashTab*)reductionOperationsHashTab->getData(id);
+   }
 
    if (gpuScope->getScopeType() == scopeNaturalLoop)
       {
@@ -3017,7 +3153,14 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
       if (tree == loopTestTree)
          continue;
 
-      if (!visitNodeToMapSymbols(tree->getNode(), pa, aa, loop, piv, lineNumber, visitCount))
+      TR_SPMDKernelParallelizer::TR_SPMDReductionInfo* reductionInfo = NULL;
+      TR_HashId id = 0;
+      if (reductionHashTab && reductionHashTab->locate(tree->getNode()->getSymbolReference(), id))
+      {
+	  reductionInfo = (TR_SPMDKernelParallelizer::TR_SPMDReductionInfo*)reductionHashTab->getData(id);
+      }
+
+      if (!visitNodeToMapSymbols(tree->getNode(), pa, aa, loop, piv, lineNumber, visitCount, reductionInfo))
          {
          return false;
          }
@@ -3110,10 +3253,9 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
 
 #ifdef ENABLE_GPU
    gpuPtxCount = comp()->getGPUPtxCount();
-
    TR::CodeGenerator::GPUResult gpuResult = comp()->cg()->dumpNVVMIR(comp()->getStartTree(), comp()->findLastTree(), loop, &blocksInLoop,
                                                                     &autos, &parms, true, programSource, errorNode, gpuPtxCount,
-                                                                    &hasExceptionChecks);
+								     &hasExceptionChecks, reductionHashTab);
 
    if (gpuResult != TR::CodeGenerator::GPUSuccess)
        return false;
@@ -3229,6 +3371,7 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
       TR::Node *node = gpuSymbolMap[nc]._node;
       TR::SymbolReference *hostSymRef = gpuSymbolMap[nc]._hostSymRef;
       int32_t parmSlot = gpuSymbolMap[nc]._parmSlot;
+      bool isReductionVar = gpuSymbolMap[nc]._isReductionVar;
 
       if (!hostSymRef) continue;
       if (parmSlot == -1) continue;
@@ -3242,8 +3385,13 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
          hostSymRef = temp;
          }
       gpuSymbolMap[nc]._hostSymRefTemp = hostSymRef;
-
-      if (!hostSymRef->getSymbol()->getType().isAddress()) continue;
+      if (!hostSymRef->getSymbol()->getType().isAddress()) {
+	  if (!isReductionVar) { // akihiro
+	      continue;
+	  } else {
+//	      gpuSymbolMap[nc]._reductionSymRef = comp()->getSymRefTab()->createTemporary(comp()->getMethodSymbol(), TR::Address);
+	  }
+      }
 
       gpuSymbolMap[nc]._devSymRef = comp()->getSymRefTab()->createTemporary(comp()->getMethodSymbol(), addressType);
       }
@@ -3414,13 +3562,13 @@ TR_SPMDKernelParallelizer::perform()
             for (kernel = kit.getFirst(); kernel; kernel = kit.getNext())
                {
                TR_ASSERT(kernel->getPrimaryInductionVariable(), "forEach loop should have PIV");
-               processGPULoop(kernel, scopeInfo);
+               processGPULoop(kernel, scopeInfo, reductionOperationsHashTab);
                }
             break;
          case scopeSingleKernel:
             kernel = scopeInfo->getSingleKernelRegion();
             TR_ASSERT(kernel->getPrimaryInductionVariable(), "forEach loop should have PIV");
-            processGPULoop(kernel, scopeInfo);
+            processGPULoop(kernel, scopeInfo, reductionOperationsHashTab);
             break;
          }
       }

@@ -39,11 +39,13 @@
 #include "il/TreeTop_inlines.hpp"
 #include "il/symbol/AutomaticSymbol.hpp"
 #include "il/symbol/ParameterSymbol.hpp"
+#include "infra/HashTab.hpp"                       // for TR_HashTab, etc
 #include "env/CompilerEnv.hpp"
 #include "env/StackMemoryRegion.hpp"
 #include "env/annotations/GPUAnnotation.hpp"
 #include "optimizer/Dominators.hpp"
 #include "optimizer/Structure.hpp"
+#include "optimizer/SPMDParallelizer.hpp"
 
 #define OPT_DETAILS "O^O CODE GENERATION: "
 
@@ -2003,7 +2005,8 @@ J9::CodeGenerator::printNVVMIR(
       vcount_t visitCount,
       TR_SharedMemoryAnnotations *sharedMemory,
       int32_t &nextParmNum,
-      TR::Node * &errorNode)
+      TR::Node * &errorNode,
+      TR_SPMDKernelParallelizer::TR_SPMDReductionInfo* reductionInfo)
    {
    GPUResult result;
 
@@ -2084,7 +2087,7 @@ J9::CodeGenerator::printNVVMIR(
             }
          }
 
-      result = self()->printNVVMIR(ir, refNode, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode);
+      result = self()->printNVVMIR(ir, refNode, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
       if (result != GPUSuccess) return result;
 
       getNodeName(refNode, name0, self()->comp());
@@ -2122,10 +2125,10 @@ J9::CodeGenerator::printNVVMIR(
 
       if (!isSMReference)
          {
-         result = self()->printNVVMIR(ir, node->getChild(0), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode);
+	     result = self()->printNVVMIR(ir, node->getChild(0), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
          if (result != GPUSuccess) return result;
          }
-      result = self()->printNVVMIR(ir, node->getChild(1), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode);
+      result = self()->printNVVMIR(ir, node->getChild(1), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
       if (result != GPUSuccess) return result;
 
       if (!isSMReference)
@@ -2155,10 +2158,10 @@ J9::CodeGenerator::printNVVMIR(
    else if (node->getOpCodeValue() == TR::DIVCHK)
       {
       TR::Node *idivNode = node->getChild(0);
-      result = self()->printNVVMIR(ir, idivNode->getChild(0), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode);
+      result = self()->printNVVMIR(ir, idivNode->getChild(0), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
       if (result != GPUSuccess) return result;
 
-      result = self()->printNVVMIR(ir, idivNode->getChild(1), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode);
+      result = self()->printNVVMIR(ir, idivNode->getChild(1), loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
       if (result != GPUSuccess) return result;
 
       getNodeName(idivNode->getChild(1), name0, self()->comp());
@@ -2194,7 +2197,56 @@ J9::CodeGenerator::printNVVMIR(
                    node->getSize());
       return GPUSuccess;
       }
-
+#if 1
+   if (reductionInfo != NULL) {
+       // this node is treetop of reduction (store)
+       // node (contains reduction var)
+       //  |- op
+       //      |- reduction var
+       //      |- some operation
+       TR::SymbolReference *reduction_var = node->getSymbolReference();//getReferenceNumber
+       TR::Node *reduction_ops = node->getChild(0);
+       if (reduction_ops) {
+	   TR::Node *operand0 = reduction_ops->getChild(0);
+	   TR::Node *operand1 = reduction_ops->getChild(1);
+	   if (operand0 && operand1) {
+	       if (operand0->getSymbolReference() == reduction_var) {
+	       } else if (operand1->getSymbolReference() == reduction_var) {
+		   // swap
+		   TR::Node *tmp = operand0;
+		   operand0 = operand1;
+		   operand1 = tmp;
+	       } else {
+		   return GPUInvalidProgram;
+	       }
+	       // operand 0: reduction var
+	       // operand 1: some value
+	       traceMsg(self()->comp(), "reduction var %d\n", operand0->getSymbolReference()->getReferenceNumber());
+	       //traceMsg(self()->comp(), "              %d\n", operand1->getSymbolReference()->getReferenceNumber());
+	       if ((operand1->getReferenceCount() >= 2 && !operand1->getOpCode().isLoadConst()) || printChildrenWithRefCount1)
+	       {
+		   result = self()->printNVVMIR(ir, operand1, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
+		   if (result != GPUSuccess)
+		       return result;
+	       }
+	       // translate the original reduction var (local) to parm
+	       CS2::ArrayOf<gpuMapElement, TR::Allocator> &gpuSymbolMap = self()->comp()->cg()->_gpuSymbolMap;
+	       int32_t symRefIndex = operand0->getSymbolReference()->getReferenceNumber();
+	       int32_t nc = symRefIndex;
+               TR::SymbolReference *reductionSymRef = gpuSymbolMap[nc]._reductionSymRef;
+	       traceMsg(self()->comp(), "reduction var(addr) %d\n", reductionSymRef->getReferenceNumber());
+	       if (reduction_ops->getOpCode().isSub()) {
+		   ir.print("  %%%d = getelementptr inbounds i8* %%p0, i32 8\n", _gpuNodeCount++);
+		   ir.print("  %%%d = bitcast i8* %%%d to i64*\n", _gpuNodeCount, _gpuNodeCount-1);
+		   node->setLocalIndex(++_gpuNodeCount);
+		   ir.print("  %%%d = atomicrmw sub i64* %%%d, i64 -1 seq_cst\n", node->getLocalIndex(), _gpuNodeCount-1);
+		   _gpuNodeCount++;
+	       }
+	   }
+       }
+       return GPUSuccess;
+   }
+#endif
    //Don't run printNVVMIR on a children node if:
    //(they are the child of a profiling call) AND ((have a reference count less then two) OR (is a loadConst node))
    for (int32_t i = 0; i < node->getNumChildren(); ++i)
@@ -2202,7 +2254,7 @@ J9::CodeGenerator::printNVVMIR(
       TR::Node *child = node->getChild(i);
       if ((child->getReferenceCount() >= 2 && !child->getOpCode().isLoadConst()) || printChildrenWithRefCount1)
          {
-         result = self()->printNVVMIR(ir, child, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode);
+	  result = self()->printNVVMIR(ir, child, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
          if (result != GPUSuccess)
             return result;
          }
@@ -2976,7 +3028,9 @@ J9::CodeGenerator::dumpNVVMIR(
       char * &nvvmIR,
       TR::Node * &errorNode,
       int gpuPtxCount,
-      bool* hasExceptionChecks)
+      bool* hasExceptionChecks,
+      TR_HashTab* reductionHashTab
+    )
    {
    static bool isbufferalign = feGetEnv("TR_disableGPUBufferAlign") ? false : true;
    NVVMIRBuffer ir(self()->comp()->trMemory());
@@ -3145,8 +3199,13 @@ J9::CodeGenerator::dumpNVVMIR(
 
       if (ait->_parmSlot != -1)
          {
-         gpuParameter parm (ait->_hostSymRef, ait->_parmSlot);
-         gpuParameterMap[ait->_parmSlot] = parm;
+	     if (!ait->_isReductionVar) {
+		 gpuParameter parm (ait->_hostSymRef, ait->_parmSlot);
+		 gpuParameterMap[ait->_parmSlot] = parm;
+	     } else {
+		 gpuParameter parm (ait->_reductionSymRef, ait->_parmSlot);
+		 gpuParameterMap[ait->_parmSlot] = parm;
+	     }
          }
       }
 
@@ -3309,7 +3368,14 @@ J9::CodeGenerator::dumpNVVMIR(
           continue;
           }
 
-      result = self()->printNVVMIR(ir, tree->getNode(), loop, &targetBlocks, visitCount, &sharedMemory, nextParmNum, errorNode);
+      TR_SPMDKernelParallelizer::TR_SPMDReductionInfo* reductionInfo = NULL;
+      TR_HashId id = 0;
+      if (reductionHashTab && reductionHashTab->locate(node->getSymbolReference(), id))
+      {
+	  reductionInfo = (TR_SPMDKernelParallelizer::TR_SPMDReductionInfo*)reductionHashTab->getData(id);
+      }
+
+      result = self()->printNVVMIR(ir, tree->getNode(), loop, &targetBlocks, visitCount, &sharedMemory, nextParmNum, errorNode, reductionInfo);
       if (result != GPUSuccess)
          {
          return result;
@@ -3458,7 +3524,7 @@ J9::CodeGenerator::generateGPU()
                           &method->getAutomaticList(),
                           &method->getParameterList(),
                           false, // TODO: check if method is static
-                          programSource, errorNode, 0, 0); //gpuPtxCount is not applicable here so it is always set to 0.
+			   programSource, errorNode, 0, 0, NULL); //gpuPtxCount is not applicable here so it is always set to 0.
 
       } // scope of the stack memory region
 

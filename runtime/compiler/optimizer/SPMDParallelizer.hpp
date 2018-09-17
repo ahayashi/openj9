@@ -254,9 +254,9 @@ class TR_SPMDKernelParallelizer : public TR_LoopTransformer
    //for doing data dependence analysis
    bool areNodesEquivalent(TR::Compilation *comp, TR::Node *node1, TR::Node *node2);
 
-   bool processGPULoop(TR_RegionStructure *loop, TR_SPMDScopeInfo* gpuScope);
+   bool processGPULoop(TR_RegionStructure *loop, TR_SPMDScopeInfo* gpuScope, TR_HashTab* reductionHashTab);
 
-   bool visitNodeToMapSymbols(TR::Node *node, ListAppender<TR::ParameterSymbol> &parms, ListAppender<TR::AutomaticSymbol> &autos, TR_RegionStructure *loop, TR_PrimaryInductionVariable *piv, int32_t lineNumber, int32_t visitCount);
+   bool visitNodeToMapSymbols(TR::Node *node, ListAppender<TR::ParameterSymbol> &parms, ListAppender<TR::AutomaticSymbol> &autos, TR_RegionStructure *loop, TR_PrimaryInductionVariable *piv, int32_t lineNumber, int32_t visitCount, TR_SPMDReductionInfo *reductionInfo);
 
    bool visitNodeToDetectArrayAccesses(TR::Node *node, TR_RegionStructure *loop, TR_PrimaryInductionVariable *piv, int32_t visitCount, int32_t lineNumber, bool &arrayNotFound, int trace, bool postDominates);
 

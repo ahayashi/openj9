@@ -39,11 +39,13 @@ namespace J9 { typedef J9::CodeGenerator CodeGeneratorConnector; }
 #include "env/IO.hpp"
 #include "env/jittypes.h"
 #include "infra/List.hpp"
+#include "infra/HashTab.hpp"
 #include "codegen/RecognizedMethods.hpp"
 #include "control/Recompilation.hpp"
 #include "control/RecompilationInfo.hpp"
 #include "optimizer/Dominators.hpp"
-#include "cs2/arrayof.h"
+#include "optimizer/SPMDParallelizer.hpp"
+#include "cs2/arrayof.h"   // for ArrayOf
 
 class NVVMIRBuffer;
 class TR_BitVector;
@@ -213,21 +215,23 @@ public:
       public:
       TR_ALLOC(TR_Memory::CodeGenerator); // dummy
 
-      gpuMapElement() : _node(NULL), _hostSymRef(NULL), _hostSymRefTemp(NULL), _devSymRef(NULL), _hoistAccess(false), _elementSize(-1), _parmSlot(-1), _accessKind(None), _lhsAddrExpr(NULL), _rhsAddrExpr(NULL) {}
+      gpuMapElement() : _node(NULL), _hostSymRef(NULL), _hostSymRefTemp(NULL), _devSymRef(NULL), _hoistAccess(false), _isReductionVar(false), _elementSize(-1), _parmSlot(-1), _accessKind(None), _lhsAddrExpr(NULL), _rhsAddrExpr(NULL) {}
 
       gpuMapElement(TR::Node *node, TR::SymbolReference *hostSymRef, int32_t elementSize, int32_t parmSlot)
                     :
-                    _node(node), _hostSymRef(hostSymRef), _hostSymRefTemp(NULL), _devSymRef(NULL), _hoistAccess(false),
+	             _node(node), _hostSymRef(hostSymRef), _hostSymRefTemp(NULL), _devSymRef(NULL), _hoistAccess(false), _isReductionVar(false),
                     _elementSize(elementSize), _parmSlot(parmSlot), _accessKind(None), _lhsAddrExpr(NULL), _rhsAddrExpr(NULL) {}
 
       TR::Node          *_node;
       TR::SymbolReference *_hostSymRef;
       TR::SymbolReference *_hostSymRefTemp;
       TR::SymbolReference *_devSymRef;
+      TR::SymbolReference *_reductionSymRef;
       int32_t             _elementSize;
       int32_t             _parmSlot;
       uint32_t            _accessKind;
       bool                _hoistAccess;
+      bool                _isReductionVar;
       TR::Node          *_rhsAddrExpr;
       TR::Node          *_lhsAddrExpr;
       };
@@ -336,9 +340,9 @@ public:
 
    void dumpInvariant(CS2::ArrayOf<gpuParameter, TR::Allocator>::Cursor pit, NVVMIRBuffer &ir, bool isbufferalign);
 
-   GPUResult dumpNVVMIR(TR::TreeTop *firstTreeTop, TR::TreeTop *lastTreeTop, TR_RegionStructure *loop, SharedSparseBitVector *blocksinLoop, ListBase<TR::AutomaticSymbol> *autos, ListBase<TR::ParameterSymbol> *parms, bool staticMethod, char * &nvvmIR, TR::Node * &errorNode, int gpuPtxCount, bool* hasExceptionChecks);
+   GPUResult dumpNVVMIR(TR::TreeTop *firstTreeTop, TR::TreeTop *lastTreeTop, TR_RegionStructure *loop, SharedSparseBitVector *blocksinLoop, ListBase<TR::AutomaticSymbol> *autos, ListBase<TR::ParameterSymbol> *parms, bool staticMethod, char * &nvvmIR, TR::Node * &errorNode, int gpuPtxCount, bool* hasExceptionChecks, TR_HashTab* reductionHashTab);
 
-   GPUResult printNVVMIR(NVVMIRBuffer &ir, TR::Node * node, TR_RegionStructure *loop, TR_BitVector *targetBlocks, vcount_t visitCount, TR_SharedMemoryAnnotations *sharedMemory, int32_t &nextParmNum, TR::Node * &errorNode);
+   GPUResult printNVVMIR(NVVMIRBuffer &ir, TR::Node * node, TR_RegionStructure *loop, TR_BitVector *targetBlocks, vcount_t visitCount, TR_SharedMemoryAnnotations *sharedMemory, int32_t &nextParmNum, TR::Node * &errorNode, TR_SPMDKernelParallelizer::TR_SPMDReductionInfo* reductionInfo);
 
    void findExtraParms(TR::Node *node, int32_t &numExtraParms, TR_SharedMemoryAnnotations *sharedMemory, vcount_t visitCount);
 
