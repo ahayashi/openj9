@@ -2941,14 +2941,16 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
           }
        }
 
+#if 0  // GITA
    if (!ibmTryGPUBlock || !lambdaCPUBlock)
       {
           traceMsg(comp(), "Stop processing since could not find ibmTryGPU or lambdaCPU Block\n");
       return false;
       }
+#endif
 
-   traceMsg(comp(), "ibmTryGPU block %d\n", ibmTryGPUBlock->getNumber());
-   traceMsg(comp(), "lambdaCPU block %d\n", lambdaCPUBlock->getNumber());
+   traceMsg(comp(), "ibmTryGPU block %d\n", ibmTryGPUBlock ? ibmTryGPUBlock->getNumber() : -1);
+   traceMsg(comp(), "lambdaCPU block %d\n", lambdaCPUBlock ? lambdaCPUBlock->getNumber() : -1);
    traceMsg(comp(), "loopInvariantBlock %d\n", loopInvariantBlock->getNumber());
 
 
@@ -3322,7 +3324,8 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
 
    //insertGPUCopyFromSequence(firstNode,copyFromGPUBlock,scopeSymRef,scopeSymRef/*launchSymRef*/,piv);
 
-   insertGPUErrorHandler(firstNode, errorHandleBlock, scopeSymRef, lambdaCPUBlock);
+   if (lambdaCPUBlock) // GITA : fix error exit when lambdaCPUBlock is NULL
+      insertGPUErrorHandler(firstNode, errorHandleBlock, scopeSymRef, lambdaCPUBlock);
 
    if (!comp()->getOptions()->getEnableGPU(TR_EnableGPUForce))
       {
@@ -3332,15 +3335,17 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-   TR::Node *ibmTryGPUNode = ibmTryGPUBlock->getLastRealTreeTop()->getNode();
-
-   if(!(_reversedBranchNodes->isSet(ibmTryGPUNode->getGlobalIndex()))) //check if not set
+   if (ibmTryGPUBlock)
       {
-      traceMsg(comp(), "Reversing branch in node %p, Global Index %u\n", ibmTryGPUNode, ibmTryGPUNode->getGlobalIndex());
-      ibmTryGPUNode->reverseBranch(ibmTryGPUNode->getBranchDestination());
-      _reversedBranchNodes->set(ibmTryGPUNode->getGlobalIndex());
-      }
+      TR::Node *ibmTryGPUNode = ibmTryGPUBlock->getLastRealTreeTop()->getNode();
 
+      if (!(_reversedBranchNodes->isSet(ibmTryGPUNode->getGlobalIndex()))) //check if not set
+         {
+         traceMsg(comp(), "Reversing branch in node %p, Global Index %u\n", ibmTryGPUNode, ibmTryGPUNode->getGlobalIndex());
+         ibmTryGPUNode->reverseBranch(ibmTryGPUNode->getBranchDestination());
+         _reversedBranchNodes->set(ibmTryGPUNode->getGlobalIndex());
+         }
+      }
    return true;
    }
 
@@ -3393,7 +3398,7 @@ TR_SPMDKernelParallelizer::perform()
    if ((!comp()->getOption(TR_DisableAutoSIMD) &&
         comp()->cg()->getSupportsAutoSIMD()) ||
         comp()->getOptions()->getEnableGPU(TR_EnableGPU))
-      collectParallelLoops(root, simdLoops, reductionOperationsHashTab, useDefInfo);
+      collectParallelLoops(root, simdLoops, gpuScopes, reductionOperationsHashTab, useDefInfo);
 
 
    ListIterator<TR_SPMDScopeInfo> scopeit(&gpuScopes);
@@ -4184,6 +4189,7 @@ bool TR_SPMDKernelParallelizer::checkIndependence(TR_RegionStructure *loop, TR_U
 void
 TR_SPMDKernelParallelizer::collectParallelLoops(TR_RegionStructure *region,
                                                 List<TR_RegionStructure> &simdLoops,
+                                                List<TR_SPMDScopeInfo> &gpuScopes,
                                                 TR_HashTab* reductionOperationsHashTab,
                                                 TR_UseDefInfo *useDefInfo)
    {
@@ -4203,8 +4209,17 @@ TR_SPMDKernelParallelizer::collectParallelLoops(TR_RegionStructure *region,
         checkLoopIteration(region,comp())))
       {
       traceMsg(comp(), "Loop %d and piv = %d collected for Auto-Vectorization\n", region->getNumber(), region->getPrimaryInductionVariable()->getSymRef()->getReferenceNumber());
+
+#if 0 // GITA
       simdLoops.add(region);
       reductionOperationsHashTab->add(region, id, reductionHashTab);
+
+#else
+      reductionOperationsHashTab->add(region, id, reductionHashTab);
+      TR_SPMDScopeInfo* pScopeInfo = new (comp()->trStackMemory()) TR_SPMDScopeInfo(comp(),region,scopeSingleKernel);
+      gpuScopes.add(pScopeInfo);
+      traceMsg(comp(), "Found independent loop %d, adding to GPU list as single kernel", region->getNumber());
+#endif
       return;
       }
 
@@ -4212,7 +4227,7 @@ TR_SPMDKernelParallelizer::collectParallelLoops(TR_RegionStructure *region,
    for (TR_StructureSubGraphNode *node = it.getFirst(); node; node = it.getNext())
       {
       if (node->getStructure()->asRegion())
-         collectParallelLoops(node->getStructure()->asRegion(), simdLoops, reductionOperationsHashTab, useDefInfo);
+         collectParallelLoops(node->getStructure()->asRegion(), simdLoops, gpuScopes, reductionOperationsHashTab, useDefInfo);
       }
    }
 

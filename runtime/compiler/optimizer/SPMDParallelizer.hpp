@@ -216,7 +216,7 @@ class TR_SPMDKernelParallelizer : public TR_LoopTransformer
    void calculateNonColdCPUBlocks(TR_RegionStructure *region, TR_ScratchList<TR::Block> *kernelBlocks,
                                TR_ScratchList<TR::Block> *coldLoopBlocks, SharedSparseBitVector *nonColdCPUBlocks);
 
-   void collectParallelLoops(TR_RegionStructure *region, List<TR_RegionStructure> &simdLoops, TR_HashTab* reductionOperationsHashTab, TR_UseDefInfo *useDefInfo);
+      void collectParallelLoops(TR_RegionStructure *region, List<TR_RegionStructure> &simdLoops, List<TR_SPMDScopeInfo> &gpuScopes, TR_HashTab* reductionOperationsHashTab, TR_UseDefInfo *useDefInfo);
    bool processSPMDKernelLoopForSIMDize(TR::Compilation *comp, TR::Optimizer *optimizer, TR_RegionStructure *loop, TR_PrimaryInductionVariable *piv, TR_HashTab* reductionHashTab, int32_t peelCount, TR::Block *invariantBlock);
 
    bool vectorize(TR::Compilation *comp, TR_RegionStructure *loop, TR_PrimaryInductionVariable *piv, TR_HashTab* reductionHashTab, int32_t peelCount, TR::Optimizer *optimizer=NULL);
