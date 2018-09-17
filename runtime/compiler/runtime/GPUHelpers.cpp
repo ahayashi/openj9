@@ -149,6 +149,7 @@ const char* (*jitCudaGetErrorString)(cudaError_t);
 CUresult (*jitCuInit)(unsigned int);
 CUresult (*jitCuLinkCreate)(unsigned int, CUjit_option*, void**, CUlinkState*);
 CUresult (*jitCuLinkAddData)(CUlinkState, CUjitInputType, void*, size_t, const char*, unsigned int, CUjit_option*, void**);
+CUresult (*jitCuLinkAddFile)(CUlinkState, CUjitInputType, const char*, unsigned int, CUjit_option*, void**);
 CUresult (*jitCuLinkComplete)(CUlinkState, void**, size_t*);
 CUresult (*jitCuModuleLoadData)(CUmodule*, const void*);
 CUresult (*jitCuDeviceGet)(CUdevice*, int);
@@ -433,6 +434,9 @@ static bool loadCudaLibrary(int tracing)
 
    jitCuLinkAddData = (CUresult (*)(CUlinkState, CUjitInputType, void*, size_t, const char*, unsigned int, CUjit_option*, void**))GET_FUNCTION(libCudaPointer, stringMacro(cuLinkAddData));
    if (checkDlError(tracing, !jitCuLinkAddData)) return false;
+
+   jitCuLinkAddFile = (CUresult (*)(CUlinkState, CUjitInputType, const char*, unsigned int, CUjit_option*, void**))GET_FUNCTION(libCudaPointer, stringMacro(cuLinkAddFile));
+   if (checkDlError(tracing, !jitCuLinkAddFile)) return false;
 
    jitCuLinkComplete = (CUresult (*)(CUlinkState, void**, size_t*))GET_FUNCTION(libCudaPointer, stringMacro(cuLinkComplete));
    if (checkDlError(tracing, !jitCuLinkComplete)) return false;
@@ -917,6 +921,16 @@ cudaModuleLoadData(CUlinkState *lState, CudaInfo *cudaInfo, const char *ptxSourc
    // Create a pending linker invocation
    returnOnTrue(captureCuError(jitCuLinkCreate(OPTIONSNUM, optionCmds, optionVals, lState), cudaInfo, "cudaModuleLoadData - jitCuLinkCreate"), ERROR_CODE);
    returnOnTrue(captureCuError(jitCuLinkAddData(*lState, CU_JIT_INPUT_PTX, (void*)ptxSource, strlen(ptxSource)+1, 0, 0, 0, 0), cudaInfo, "cudaModuleLoadData - jitCuLinkAddData"), ERROR_CODE);
+
+   // Add an external a ptx source file
+   static char* externalPtx = feGetEnv("TR_externalPTX");
+   if (externalPtx) {
+       TR_VerboseLog::writeLine(TR_Vlog_GPU, "Adding an external ptx file: %s", externalPtx);
+       returnOnTrue(captureCuError(jitCuLinkAddFile(*lState, CU_JIT_INPUT_PTX, externalPtx, 0, 0, 0), cudaInfo, "cudaModuleLoadFile - jitCuLinkAddFile"), ERROR_CODE);
+   } else {
+       TR_VerboseLog::writeLine(TR_Vlog_GPU, "TR_externalPTX not defined: %s");
+   }
+
    returnOnTrue(captureCuError(jitCuLinkComplete(*lState, &cubin, &cubinSize), cudaInfo, "cudaModuleLoadData - jitCuLinkComplete"), ERROR_CODE);
  
    if (writeLINKER)
@@ -1173,14 +1187,16 @@ static bool addlibDeviceToProgram(nvvmProgram program, int computeArch, bool tra
    //Use libdevice for compute_20, if the target is not compute_30 or compute_35.
    switch (computeArch)
       {
+#if 0
       case 30:
          libdeviceByteCode = "/libdevice/libdevice.compute_30.10.bc";
          break;
       case 35:
          libdeviceByteCode = "/libdevice/libdevice.compute_35.10.bc";
          break;
+#endif
       default:
-         libdeviceByteCode = "/libdevice/libdevice.compute_20.10.bc";
+         libdeviceByteCode = "/libdevice/libdevice.10.bc";
          break;
       }
 

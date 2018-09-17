@@ -2239,8 +2239,23 @@ J9::CodeGenerator::printNVVMIR(
 		   ir.print("  %%%d = getelementptr inbounds i8* %%p0, i32 8\n", _gpuNodeCount++);
 		   ir.print("  %%%d = bitcast i8* %%%d to i64*\n", _gpuNodeCount, _gpuNodeCount-1);
 		   node->setLocalIndex(++_gpuNodeCount);
+#if 0
 		   ir.print("  %%%d = atomicrmw sub i64* %%%d, i64 -1 seq_cst\n", node->getLocalIndex(), _gpuNodeCount-1);
 		   _gpuNodeCount++;
+#else
+		   ir.print("  %%val = add i64 1, 0\n");
+		   ir.print("  %%call = call i64 @_Z13warpReduceSuml(i64 %%val)\n");
+		   ir.print("  %%WSIZ = call i32 @llvm.nvvm.read.ptx.sreg.warpsize()\n");
+		   ir.print("  %%wsize = sub i32 %%WSIZ, 1\n");
+		   ir.print("  %%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n");
+		   ir.print("  %%lane = and i32 %%tid, %%wsize\n");
+		   ir.print("  %%lane0 = icmp eq i32 %%lane, 0\n");
+		   ir.print("  br i1 %%lane0, label %%lb_lane0, label %%lb_else\n");
+	           ir.print("lb_lane0:\n");
+		   ir.print("  %%res = atomicrmw add i64* %%%d, i64 %%call seq_cst\n", node->getLocalIndex()-1);
+		   ir.print("  br label %%lb_else\n");
+		   ir.print("lb_else:\n");
+#endif
 	       }
 	   }
        }
@@ -3443,6 +3458,8 @@ J9::CodeGenerator::dumpNVVMIR(
    ir.print("declare i32 @llvm.nvvm.read.ptx.sreg.tid.y() nounwind readnone\n");
    ir.print("declare i32 @llvm.nvvm.read.ptx.sreg.tid.z() nounwind readnone\n");
 
+   ir.print("declare i32 @llvm.nvvm.read.ptx.sreg.warpsize() nounwind readnone\n");
+
    if (self()->comp()->getOptions()->getEnableGPU(TR_EnableGPUEnableMath))
       {
       ir.print("declare double @__nv_sin(double)\n");
@@ -3455,6 +3472,8 @@ J9::CodeGenerator::dumpNVVMIR(
       }
 
    ir.print("declare void @llvm.nvvm.barrier0() nounwind readnone\n");
+
+   ir.print("declare i64 @_Z13warpReduceSuml(i64)\n");
 
    ir.print("!10 = metadata !{i32    0}\n");
    ir.print("!11 = metadata !{i32    1}\n");
