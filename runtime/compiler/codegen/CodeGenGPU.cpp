@@ -165,7 +165,7 @@ static const char * nvvmOpCodeNames[] =
    "udiv",        // TR::ludiv
 
    "srem",          // TR::irem
-   "srem",          // TR::lrem
+   "srem",          // TR::rem
    "frem",          // TR::frem
    "frem",          // TR::drem
    "srem",          // TR::brem
@@ -2207,57 +2207,79 @@ J9::CodeGenerator::printNVVMIR(
        TR::SymbolReference *reduction_var = node->getSymbolReference();//getReferenceNumber
        TR::Node *reduction_ops = node->getChild(0);
        if (reduction_ops) {
-	   TR::Node *operand0 = reduction_ops->getChild(0);
-	   TR::Node *operand1 = reduction_ops->getChild(1);
-	   if (operand0 && operand1) {
-	       if (operand0->getSymbolReference() == reduction_var) {
-	       } else if (operand1->getSymbolReference() == reduction_var) {
-		   // swap
-		   TR::Node *tmp = operand0;
-		   operand0 = operand1;
-		   operand1 = tmp;
-	       } else {
-		   return GPUInvalidProgram;
-	       }
-	       // operand 0: reduction var
-	       // operand 1: some value
-	       traceMsg(self()->comp(), "reduction var %d\n", operand0->getSymbolReference()->getReferenceNumber());
-	       //traceMsg(self()->comp(), "              %d\n", operand1->getSymbolReference()->getReferenceNumber());
-	       if ((operand1->getReferenceCount() >= 2 && !operand1->getOpCode().isLoadConst()) || printChildrenWithRefCount1)
-	       {
-		   result = self()->printNVVMIR(ir, operand1, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
-		   if (result != GPUSuccess)
-		       return result;
-	       }
-	       // translate the original reduction var (local) to parm
-	       CS2::ArrayOf<gpuMapElement, TR::Allocator> &gpuSymbolMap = self()->comp()->cg()->_gpuSymbolMap;
-	       int32_t symRefIndex = operand0->getSymbolReference()->getReferenceNumber();
-	       int32_t nc = symRefIndex;
+           TR::Node *operand0 = reduction_ops->getChild(0);
+           TR::Node *operand1 = reduction_ops->getChild(1);
+           if (operand0 && operand1) {
+               // swap operand0 and operand1 if needed
+               if (operand0->getSymbolReference() == reduction_var) {
+                   // do nothing
+                   ;
+               } else if (operand1->getSymbolReference() == reduction_var) {
+                   // swap
+                   TR::Node *tmp = operand0;
+                   operand0 = operand1;
+                   operand1 = tmp;
+               } else {
+                   return GPUInvalidProgram;
+               }
+               // operand 0: reduction var
+               // operand 1: some value (e.g., constant, load instruction, ...)
+               if ((operand1->getReferenceCount() >= 2 && !operand1->getOpCode().isLoadConst()) ||printChildrenWithRefCount1)
+                   {
+                       result = self()->printNVVMIR(ir, operand1, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, NULL);
+                       if (result != GPUSuccess)
+                           return result;
+                   }
+               // translate the original reduction var (host) to parm
+               CS2::ArrayOf<gpuMapElement, TR::Allocator> &gpuSymbolMap = self()->comp()->cg()->_gpuSymbolMap;
+               int32_t symRefIndex = operand0->getSymbolReference()->getReferenceNumber();
+               int32_t nc = symRefIndex;
                TR::SymbolReference *reductionSymRef = gpuSymbolMap[nc]._reductionSymRef;
-	       traceMsg(self()->comp(), "reduction var(addr) %d\n", reductionSymRef->getReferenceNumber());
-	       if (reduction_ops->getOpCode().isSub()) {
-		   ir.print("  %%%d = getelementptr inbounds i8* %%p0, i32 8\n", _gpuNodeCount++);
-		   ir.print("  %%%d = bitcast i8* %%%d to i64*\n", _gpuNodeCount, _gpuNodeCount-1);
-		   node->setLocalIndex(++_gpuNodeCount);
+               traceMsg(self()->comp(), "reduction var(devSymref) %d, (hostSymref) %d, slot: %d\n", reductionSymRef->getReferenceNumber(), symRefIndex, gpuSymbolMap[nc]._parmSlot);
+               // get the address of the reduction variables (since it's array, the offset is 8 to skip Java's array header)
+               const char *type0 = getTypeName(operand0->getDataType());
+               ir.print("  %%%d = getelementptr inbounds i8* %%p%d, i32 8\n", _gpuNodeCount++, gpuSymbolMap[nc]._parmSlot);
+               ir.print("  %%%d = bitcast i8* %%%d to %s*\n", _gpuNodeCount, _gpuNodeCount-1, type0);
+               node->setLocalIndex(++_gpuNodeCount);
+
+               if (operand1->getOpCode().isLoadConst()) {
+                   ir.print("  call void @reduce_%s(%s* %%%d, %s %d)\n", type0, type0, _gpuNodeCount-1, type0, -operand1->getInt());
+               } else {
+                   //ir.print("  call void @reduce_%s(%s* %%%d, %s %%%d)\n",type0, type0, _gpuNodeCount-1, type0, _gpuNodeCount-3);
+                   // avg
+                   //ir.print("  call void @reduce_long(%s* %%%d, %s %%%d, %s %%%d)\n",type0, _gpuNodeCount-1, "i8*", _gpuNodeCount-6, "i64", _gpuNodeCount-4);
+                   // sum
+                   ir.print("  call void @reduce_%s(%s* %%%d, %s %%%d)\n", type0, type0, _gpuNodeCount-1, type0, _gpuNodeCount-3);
+               }
 #if 0
-		   ir.print("  %%%d = atomicrmw sub i64* %%%d, i64 -1 seq_cst\n", node->getLocalIndex(), _gpuNodeCount-1);
-		   _gpuNodeCount++;
-#else
-		   ir.print("  %%val = add i64 1, 0\n");
-		   ir.print("  %%call = call i64 @_Z13warpReduceSuml(i64 %%val)\n");
-		   ir.print("  %%WSIZ = call i32 @llvm.nvvm.read.ptx.sreg.warpsize()\n");
-		   ir.print("  %%wsize = sub i32 %%WSIZ, 1\n");
-		   ir.print("  %%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n");
-		   ir.print("  %%lane = and i32 %%tid, %%wsize\n");
-		   ir.print("  %%lane0 = icmp eq i32 %%lane, 0\n");
-		   ir.print("  br i1 %%lane0, label %%lb_lane0, label %%lb_else\n");
-	           ir.print("lb_lane0:\n");
-		   ir.print("  %%res = atomicrmw add i64* %%%d, i64 %%call seq_cst\n", node->getLocalIndex()-1);
-		   ir.print("  br label %%lb_else\n");
-		   ir.print("lb_else:\n");
+               if (reduction_ops->getOpCode().isAdd()) {
+                   ir.print("  %%%d = atomicrmw add %s* %%%d, %s %%%d seq_cst\n", node->getLocalIndex(), getTypeName(operand0->getDataType()), _gpuNodeCount-1, getTypeName(operand1->getDataType()), _gpuNodeCount-3);
+                   _gpuNodeCount++;
+               }
+               if (reduction_ops->getOpCode().isSub()) {
+
+               }
+
+                   //ir.print("  %%%d = atomicrmw sub i64* %%%d, i64 -1 seq_cst\n", node->getLocalIndex(), _gpuNodeCount-1);
+               if (operand1->getOpCode().isLoadConst()) {
+                       ir.print("  %%%d = atomicrmw sub %s* %%%d, %s %d seq_cst\n", node->getLocalIndex(), getTypeName(operand0->getDataType()), _gpuNodeCount-1, getTypeName(operand1->getDataType()), operand1->getInt());
+               }
+               _gpuNodeCount++;
+               ir.print("  %%val = add i64 1, 0\n");
+               ir.print("  %%call = call i64 @_Z13warpReduceSuml(i64 %%val)\n");
+               ir.print("  %%WSIZ = call i32 @llvm.nvvm.read.ptx.sreg.warpsize()\n");
+               ir.print("  %%wsize = sub i32 %%WSIZ, 1\n");
+               ir.print("  %%tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()\n");
+               ir.print("  %%lane = and i32 %%tid, %%wsize\n");
+               ir.print("  %%lane0 = icmp eq i32 %%lane, 0\n");
+               ir.print("  br i1 %%lane0, label %%lb_lane0, label %%lb_else\n");
+               ir.print("lb_lane0:\n");
+               ir.print("  %%res = atomicrmw add i64* %%%d, i64 %%call seq_cst\n", node->getLocalIndex()-1);
+               ir.print("  br label %%lb_else\n");
+               ir.print("lb_else:\n");
+               }
 #endif
-	       }
-	   }
+           }
        }
        return GPUSuccess;
    }
@@ -2269,9 +2291,9 @@ J9::CodeGenerator::printNVVMIR(
       TR::Node *child = node->getChild(i);
       if ((child->getReferenceCount() >= 2 && !child->getOpCode().isLoadConst()) || printChildrenWithRefCount1)
          {
-	  result = self()->printNVVMIR(ir, child, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, reductionInfo);
-         if (result != GPUSuccess)
-            return result;
+             result = self()->printNVVMIR(ir, child, loop, targetBlocks, visitCount, sharedMemory, nextParmNum, errorNode, NULL);
+             if (result != GPUSuccess)
+                 return result;
          }
       }
 
@@ -3387,7 +3409,7 @@ J9::CodeGenerator::dumpNVVMIR(
       TR_HashId id = 0;
       if (reductionHashTab && reductionHashTab->locate(node->getSymbolReference(), id))
       {
-	  reductionInfo = (TR_SPMDKernelParallelizer::TR_SPMDReductionInfo*)reductionHashTab->getData(id);
+          reductionInfo = (TR_SPMDKernelParallelizer::TR_SPMDReductionInfo*)reductionHashTab->getData(id);
       }
 
       result = self()->printNVVMIR(ir, tree->getNode(), loop, &targetBlocks, visitCount, &sharedMemory, nextParmNum, errorNode, reductionInfo);
@@ -3473,7 +3495,8 @@ J9::CodeGenerator::dumpNVVMIR(
 
    ir.print("declare void @llvm.nvvm.barrier0() nounwind readnone\n");
 
-   ir.print("declare i64 @_Z13warpReduceSuml(i64)\n");
+   ir.print("declare void @reduce_i64(i64*,i64)\n");
+   ir.print("declare void @reduce_double(double*,double)\n");
 
    ir.print("!10 = metadata !{i32    0}\n");
    ir.print("!11 = metadata !{i32    1}\n");
@@ -3749,4 +3772,3 @@ J9::CodeGenerator::objectHeaderInvariant()
    {
    return self()->objectLengthOffset() + 4 /*length*/ ;
    }
-
