@@ -144,6 +144,13 @@ cudaError_t (*jitCudaStreamCreate)(cudaStream_t*);
 cudaError_t (*jitCudaStreamSynchronize)(cudaStream_t);
 const char* (*jitCudaGetErrorString)(cudaError_t);
 
+#ifdef ENABLE_GPU_PROFILING
+cudaError_t (*jitCudaEventCreate)(cudaEvent_t*, unsigned int);
+cudaError_t (*jitCudaEventRecord)(cudaEvent_t, cudaStream_t);
+cudaError_t (*jitCudaEventSynchronize)(cudaEvent_t);
+cudaError_t (*jitCudaEventElapsedTime)(float*, cudaEvent_t, cudaEvent_t);
+cudaError_t (*jitCudaStreamAddCallback)(cudaStream_t, cudaStreamCallback_t, void*, unsigned int);
+#endif
 
 //CUDA Driver library functions
 CUresult (*jitCuInit)(unsigned int);
@@ -408,6 +415,23 @@ static bool loadCudaRuntimeLibrary(int tracing)
 
    jitCudaGetErrorString = (const char* (*)(cudaError_t))GET_FUNCTION(libCudartPointer, stringMacro(cudaGetErrorString));
    if (checkDlError(tracing, !jitCudaGetErrorString)) return false;
+
+#ifdef ENABLE_GPU_PROFILING
+   jitCudaEventCreate = (cudaError_t (*)(cudaEvent_t*, unsigned int))GET_FUNCTION(libCudartPointer, stringMacro(cudaEventCreate));
+   if (checkDlError(tracing, !jitCudaEventCreate)) return false;
+
+   jitCudaEventRecord = (cudaError_t (*)(cudaEvent_t, cudaStream_t))GET_FUNCTION(libCudartPointer, stringMacro(cudaEventRecord));
+   if (checkDlError(tracing, !jitCudaEventRecord)) return false;
+
+   jitCudaEventSynchronize = (cudaError_t (*)(cudaEvent_t))GET_FUNCTION(libCudartPointer, stringMacro(cudaEventSynchronize));
+   if (checkDlError(tracing, !jitCudaEventSynchronize)) return false;
+
+   jitCudaEventElapsedTime = (cudaError_t (*)(float*, cudaEvent_t, cudaEvent_t))GET_FUNCTION(libCudartPointer, stringMacro(cudaEventElapsedTime));
+   if (checkDlError(tracing, !jitCudaEventElapsedTime)) return false;
+
+   jitCudaStreamAddCallback = (cudaError_t (*)(cudaStream_t, cudaStreamCallback_t, void*, unsigned int))GET_FUNCTION(libCudartPointer, stringMacro(cudaStreamAddCallback));
+   if (checkDlError(tracing, !jitCudaStreamAddCallback)) return false;
+#endif
    
    return true;
    }

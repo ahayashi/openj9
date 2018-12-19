@@ -68,6 +68,10 @@ ifdef ENABLE_GPU
 
     PRODUCT_INCLUDES+=$(CUDA_HOME)/include $(CUDA_HOME)/nvvm/include $(GDK_HOME)
     PRODUCT_DEFINES+=ENABLE_GPU
+
+    ifdef ENABLE_GPU_PROFILING
+        PRODUCT_DEFINES+=ENABLE_GPU_PROFILING
+    endif
 endif
 
 PRODUCT_RELEASE?=tr.open.java
