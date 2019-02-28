@@ -1376,6 +1376,10 @@ createMethodMetaData(
    int32_t gpuPtxArrayOffset = -1;
    int32_t gpuPtxArrayEntryOffset = -1;
    int32_t gpuCuModuleArrayOffset = -1;
+#ifdef ENABLE_GPU_PROFILING
+   int32_t gpuProfilingDataOffset = -1;
+   int32_t gpuAsyncProfilerOffset = -1;
+#endif
 
    int32_t maxNumCachedDevices = 8; // max # of GPGPU cards that JIT compile can cache CUmodule for
    int32_t sizeOfCUmodule = 0;
@@ -1405,6 +1409,14 @@ createMethodMetaData(
 
       gpuCuModuleArrayOffset = tableSize;
       tableSize += sizeOfCUmodule * comp->getGPUPtxCount() * maxNumCachedDevices;
+
+#ifdef ENABLE_GPU_PROFILING
+      gpuProfilingDataOffset = tableSize;
+      tableSize += sizeof(void*) * comp->getGPUPtxCount() * maxNumCachedDevices;
+
+      gpuAsyncProfilerOffset = tableSize;
+      tableSize += sizeof(void*) * comp->getGPUPtxCount();
+#endif
       }
 
 
@@ -1648,6 +1660,16 @@ createMethodMetaData(
       void* gpuCuModuleArrayLocation = (void*)((uint8_t*)data + gpuCuModuleArrayOffset);
       gpuMetaDataLocation->cuModuleArray = gpuCuModuleArrayLocation;
       memset(gpuCuModuleArrayLocation, 0, sizeOfCUmodule * comp->getGPUPtxCount() * maxNumCachedDevices);
+
+#ifdef ENABLE_GPU_PROFILING
+      void** gpuProfilingDataLocation = (void**)((uint8_t*)data + gpuProfilingDataOffset);
+      gpuMetaDataLocation->profileData = gpuProfilingDataLocation;
+      memset(gpuProfilingDataLocation, 0, sizeof(void*) * comp->getGPUPtxCount() * maxNumCachedDevices);
+
+      void** gpuAsyncProfilerLocation = (void**)((uint8_t*)data + gpuAsyncProfilerOffset);
+      gpuMetaDataLocation->gpuAsyncProfiler = gpuAsyncProfilerLocation;
+      memset(gpuAsyncProfilerLocation, 0, sizeof(void*) * comp->getGPUPtxCount());
+#endif
       }
 
    if (comp->getPersistentInfo()->isRuntimeInstrumentationEnabled() &&

@@ -190,6 +190,10 @@ typedef struct TR_MapIterator
       int* lineNumberArray;     //pointer to an array containing the source line number of each gpu kernel
       char** ptxArray;          //PTX code is stored as a char* string. This is an array that points to each entry.
       void* cuModuleArray;      //Array of cached CUmodules. One entry per PTX kernel and device combination
+#ifdef ENABLE_GPU_PROFILING
+      void** profileData;        // Array of pointers to profiling data. One entry per kernel and device combination
+      void** gpuAsyncProfiler;   // Array of pointers to GPU profiler with CUDA events. One entry per kernel
+#endif
       };
 
 #if defined(DEBUG)
