@@ -64,6 +64,9 @@
 #define GPU_EXEC_SUCCESS 0
 #define GPU_EXEC_FAIL_RECOVERABLE 1
 #define GPU_EXEC_FAIL_NOT_RECOVERABLE 2
+#ifdef ENABLE_GPU_PROFILING
+#define GPU_EXEC_SUCCESS_PROFILING 3
+#endif
 
 // returns time stamp in microseconds
 // on Linux this is the number of microseconds since epoch
@@ -726,6 +729,431 @@ struct HashEntry
    size_t      cpOutEndAddressOffset;
    };
 
+/////////////////////////////////////////////////////////////////////////////////////
+// GPU Profiling and Regression data structures
+/////////////////////////////////////////////////////////////////////////////////////
+#ifdef ENABLE_GPU_PROFILING
+#undef PROFILING_DO_PREDICT
+
+// To acuire and release locks
+#include <mutex>
+
+// The size of ProfilingHashTable
+#define NUM_PROF_SAMPLES 128
+
+// For state transitions between normal and profiling mode.
+namespace GPUExecutionMode { enum executionMode { normal, profiling }; };
+
+// GPUProfilingTable is used
+// for measuring GPU time using CUDA events and callbacks.
+class GPUProfilingTable;
+
+// [GPUProfilingTableEnry (Per Kernel)]
+// GPUProfilingTableEntry stores information on one kernel execution.
+// This info is initialized by the launchKernel helper and is passed to the GPU callback.
+// The callback is called immediately after the GPU execution finishes
+// and it adds the info (ProfilingTableEntry) to GPUProfilingTable.
+struct GPUProfilingTableEntry {
+   int kernelID;
+   int range;
+   cudaEvent_t start;            // when the kernel execution started
+   cudaEvent_t end;              // when the kernel execution finished
+   cudaEvent_t finish;           // when the callback finished (only for overhead analysis purpose)
+   int hasExceptionChecks;       // if exception checks are performed
+   TR::CodeGenerator::GPUResult *ExceptionKind; // if exceptions occur, just drop this entry
+   GPUProfilingTable* parent;    // to locate the parent table
+   GPUProfilingTableEntry* next; // this is a linked-list
+};
+
+// [GPUProfilingTable (Per Kernel)]
+// GPUProfilingTable is a linked-list of GPUProfilingTableEntry.
+class GPUProfilingTable {
+public:
+   GPUProfilingTable()
+      {
+      current_head = &dummy_head;
+      }
+
+   // Push back a new entry to the list.
+   // This function is supposed to be called by the GPU callback.
+   void addEntry(GPUProfilingTableEntry *entry)
+      {
+      // acquire a lock
+      mutexLock.lock();
+      // push back the entry
+      current_head->next = entry;
+      current_head = entry;
+      // release the lock
+      mutexLock.unlock();
+#ifdef PROFILING_LOWLEVEL_DEBUG
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Callback is adding a new entry (kernelId:%d, range:%d)\n", entry->kernelID, entry->range);
+#endif
+      }
+
+   // Remove a entry from the table.
+   void removeEntry(GPUProfilingTableEntry *entry)
+      {
+      GPUProfilingTableEntry* prev = &dummy_head;
+      GPUProfilingTableEntry*curr = prev->next;
+      while (curr != NULL)
+         {
+         if (curr == entry)
+            {
+#ifdef PROFILING_LOWLEVEL_DEBUG
+            TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Removing an entry (kernelId:%d, range:%d) @ estimateGPU()\n", entry->kernelID, entry->range);
+#endif
+            mutexLock.lock();
+            prev->next = curr->next;
+            if (curr == current_head)
+               {
+               current_head = prev;
+               }
+            mutexLock.unlock();
+            TR_Memory::jitPersistentFree(entry);
+            break;
+            }
+         prev = curr;
+         curr = curr->next;
+         }
+      }
+
+   // To get an entry with a specific kernelID and range.
+   GPUProfilingTableEntry* getEntry(int kernelID)
+      {
+      GPUProfilingTableEntry* curr = dummy_head.next;
+      while (curr != NULL)
+         {
+         if (curr->kernelID == kernelID)
+            {
+            return curr;
+            }
+         curr = curr->next;
+         }
+      return NULL;
+      }
+
+   // For debugging purpose
+#ifdef PROFILING_LOWLEVEL_DEBUG
+   void printGPUProfilingTable()
+      {
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "\tPrinting GPUProfilingTable: current_head = 0x%x", current_head);
+      GPUProfilingTableEntry* curr = dummy_head.next;
+      while (curr != NULL)
+         {
+         TR_VerboseLog::writeLine(TR_Vlog_GPU, "\t\t[0x%x, kernelID:%d, range:%d]", curr, curr->kernelID, curr->range);
+         curr = curr->next;
+         }
+      }
+#endif
+
+private:
+    GPUProfilingTableEntry dummy_head;
+    GPUProfilingTableEntry* current_head;
+    std::mutex mutexLock;
+};
+
+// [CallBack]
+// This function is called immediately after the kernel execution finishes.
+// Add performance information to GPUProfilingTable
+void CUDART_CB profilingCallback(cudaStream_t stream, cudaError_t status, void *data)
+   {
+   if (status == cudaSuccess)
+      {
+      GPUProfilingTableEntry *entry = (GPUProfilingTableEntry*)data;
+      // add pinfo to the global table
+      if (entry->hasExceptionChecks)
+         {
+         if (entry->ExceptionKind != NULL)
+            {
+            TR::CodeGenerator::GPUResult ExceptionKind = *entry->ExceptionKind;
+            if (ExceptionKind == TR::CodeGenerator::GPUSuccess)
+               {
+#ifdef PROFILING_LOWLEVEL_DEBUG
+               TR_VerboseLog::writeLine(TR_Vlog_GPU,"[Profiling] Callback : GPU Success (w/ exception checks)\n");
+#endif
+               entry->parent->addEntry(entry);
+               }
+            else
+               {
+#ifdef PROFILING_LOWLEVEL_DEBUG
+               TR_VerboseLog::writeLine(TR_Vlog_GPU,"[Profiling] Callback : GPU Fail (w/ exception checks)\n");
+#endif
+               }
+            free(entry->ExceptionKind);
+            }
+         }
+      else
+         {
+#ifdef PROFILING_LOWLEVEL_DEBUG
+         TR_VerboseLog::writeLine(TR_Vlog_GPU,"[Profiling] Callback : GPU Success (w/o exception checks)\n");
+#endif
+         entry->parent->addEntry(entry);
+         }
+      }
+   }
+
+// [Profiling Storage Entry (Per Range)]
+// ProfilingStorageEntry stores historical CPU and GPU execution timings
+// with a specific loop range and kernel.
+// The average, variance, and standard deviation of CPU and GPU time
+// are updated incrementally.
+struct ProfilingStorageEntry {
+public:
+   double cpuMean;             // CPU Mean
+   double gpuMean;             // GPU Mean
+   double cpuSampleVariance;         // CPU Variance
+   double gpuSampleVariance;         // GPU Variance
+   double cpuSampleStddev;           // CPU Stddev
+   double gpuSampleStddev;           // GPU Stddev
+   double t_value;             // t-value
+   double dof;                 // degree of freedom
+   int numCPUSamplesObserved;
+   int numGPUSamplesObserved;
+
+   int parallelCount;
+};
+
+// [Profiling Storage (Per Range)]
+// Profiling Storage is a hash table of ProfilingStorageEntry
+// Also, this allows the runtime to decide to whether to use GPU with historical CPU and GPU execution timings.
+class ProfilingHashTable {
+
+public:
+   ProfilingHashTable()
+      {
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Initializing ProfilingHashTable with %d entries", NUM_PROF_SAMPLES);
+      // initialize the list
+      int32_t i = 0;
+      for (; i < NUM_PROF_SAMPLES; i++)
+         {
+         profileStorage[i].cpuMean = 0.0;
+         profileStorage[i].gpuMean = 0.0;
+         profileStorage[i].cpuSampleVariance = 0.0;
+         profileStorage[i].gpuSampleVariance = 0.0;
+         profileStorage[i].cpuSampleStddev = 0.0;
+         profileStorage[i].gpuSampleStddev = 0;
+         profileStorage[i].numCPUSamplesObserved = 0;
+         profileStorage[i].numGPUSamplesObserved = 0;
+         profileStorage[i].t_value = 0.0;
+         profileStorage[i].dof = 0.0;
+         profileStorage[i].parallelCount = -1;
+         }
+      execMode = GPUExecutionMode::profiling;
+      initPredictors();
+      }
+
+   void initPredictors()
+      {
+      }
+
+   GPUExecutionMode::executionMode getCurrentExeMode()
+      {
+      return execMode;
+      }
+
+   // Suggest a preferrable execution mode by looking at current CPU and GPU timings information.
+   GPUExecutionMode::executionMode getNextExeMode(int parallelCount)
+      {
+      GPUExecutionMode::executionMode nextMode = execMode;
+      return nextMode;
+      }
+
+   // Update the GPU timings
+   void updateGPUEntry(int parallelCount, double gpuTime)
+      {
+      mutexLock.lock();
+      ProfilingStorageEntry* profDataPtr = getOrAllocEntry(parallelCount);
+      if (profDataPtr != NULL)
+         {
+         // update average gpu time
+         double n = profDataPtr->numGPUSamplesObserved + 1;
+         double m = profDataPtr->gpuMean;
+         double s = profDataPtr->gpuSampleVariance;
+         double x = gpuTime;
+
+         // update the statistics iteratively
+         profDataPtr->gpuMean = ((n-1) * m + x) / n;
+         profDataPtr->gpuSampleVariance = (n == 1)? 0 : (((n-2) * s ) / (n-1)) + (x - m) * (x - m) / n;
+         profDataPtr->gpuSampleStddev = sqrt(profDataPtr->gpuSampleVariance);
+         profDataPtr->numGPUSamplesObserved++;
+
+         //
+         profDataPtr->t_value = computeTvalue(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
+         profDataPtr->dof = computeDOF(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
+         mutexLock.unlock();
+
+         TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] GPU ProfilingStorage Updated (range: %d, time: %.4f msec) -> (average CPU time: %.3f msec, average GPU time: %.3f, t_value=%.3f, dof=%.3f)", parallelCount, gpuTime, profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->t_value, profDataPtr->dof);
+        // update the model
+#ifdef PROFILING_DO_PREDICT
+         updatePredictor(gpuPredictor, parallelCount, profDataPtr->gpuMean);
+#endif
+         }
+      else
+         {
+         // TODO: error handling
+         mutexLock.unlock();
+         }
+      }
+
+   // Update the CPU timings
+   void updateCPUEntry(int parallelCount, double cpuTime)
+      {
+       mutexLock.lock();
+       ProfilingStorageEntry* profDataPtr = getOrAllocEntry(parallelCount);
+       if (profDataPtr != NULL)
+          {
+          // update average cpu time
+          double n = profDataPtr->numCPUSamplesObserved + 1;
+          double m = profDataPtr->cpuMean;
+          double s = profDataPtr->cpuSampleVariance;
+          double x = cpuTime;
+
+          // update the average iteratively
+          profDataPtr->cpuMean = ((n-1) * m + x) / n;
+          profDataPtr->cpuSampleVariance = (n == 1)? 0 : (((n-2) * s ) / (n-1)) + (x - m) * (x - m) / n;
+          profDataPtr->cpuSampleStddev = sqrt(profDataPtr->cpuSampleVariance);
+          profDataPtr->numCPUSamplesObserved++;
+
+          //
+          profDataPtr->t_value = computeTvalue(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
+          profDataPtr->dof = computeDOF(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
+          mutexLock.unlock();
+
+          TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] CPU ProfilingStorage Updated (range: %d, time: %.4f msec) -> (average CPU time: %.3f msec, average GPU time: %.3f, t_value=%.3f, dof=%.3f)", parallelCount, cpuTime, profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->t_value, profDataPtr->dof);
+          // update the model
+#ifdef PROFILING_DO_PREDICT
+            updatePredictor(cpuPredictor, parallelCount, profDataPtr->cpuMean);
+#endif
+          }
+       else
+          {
+          // TODO: error handling
+          mutexLock.unlock();
+          }
+      }
+
+   // return true if the given parallelCount is in the storage.
+   bool isKnownRange(int parallelCount)
+      {
+      return (getEntry(parallelCount) != NULL);
+      }
+
+  // return true if we can say the performance prediciton is accurate enough.
+  bool isPredictorAccurate(int parallelCount)
+     {
+     return false;
+     }
+
+   // return true if we're pretty sure that the GPU version is faster.
+   bool gpuIsFaster(int parallelCount, int numArrays, int H2D1, int H2D2, int H2D3, int H2D4, int H2D5, int D2H1, int D2H2, int D2H3, int D2H4, int D2H5)
+      {
+      return false;
+      }
+
+private:
+   ProfilingStorageEntry* getOrAllocEntry(int parallelCount)
+      {
+      int32_t i = 0;
+      for (; i < NUM_PROF_SAMPLES; i++)
+         {
+         if (profileStorage[i].parallelCount == parallelCount || profileStorage[i].parallelCount == -1)
+            {
+            profileStorage[i].parallelCount = parallelCount;
+            return &(profileStorage[i]);
+            }
+            }
+      return NULL;
+      }
+
+   ProfilingStorageEntry* getEntry(int parallelCount)
+      {
+      int32_t i = 0;
+      for (; i < NUM_PROF_SAMPLES; i++)
+         {
+         if (profileStorage[i].parallelCount == parallelCount)
+            {
+            profileStorage[i].parallelCount = parallelCount;
+            return &(profileStorage[i]);
+            }
+         else if (profileStorage[i].parallelCount == -1)
+            {
+            return NULL;
+            }
+         }
+      return NULL;
+      }
+
+   double computeTvalue(double uc, double ug, double sc2, double sg2, int nc, int ng) {
+      return (uc - ug) / sqrt(sc2/(double)nc + sg2/(double)ng);
+   }
+
+   double computeDOF(double uc, double ug, double sc2, double sg2, int nc, int ng) {
+      double tmp = sc2/(double)nc + sg2/(double)ng;
+      return (tmp*tmp) / ((sc2*sc2) / (nc*nc*(nc-1)) + (sg2*sg2) / (ng*ng*(ng-1)));
+   }
+
+#ifdef PROFILING_DO_PREDICT
+   void updatePredictor(orlib::Regressor<double> *predictor, int parallelCount, double time)
+      {
+      double startTime, endTime;
+      startTime = currentTime();
+      orlib::Vector<double> feature(1);
+      feature[0] = parallelCount;
+      predictor->train(feature, time);
+      endTime = currentTime();
+#ifdef PROFILING_LOWLEVEL_DEBUG
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] %s Regressor Updated: %.3f msec", (predictor == cpuPredictor)? "CPU" : "GPU", (endTime-startTime)/1000);
+#endif
+      }
+#endif
+
+   // private fields
+   ProfilingStorageEntry profileStorage[NUM_PROF_SAMPLES];
+#ifdef PROFILING_DO_PREDICT
+   orlib::Regressor<double> *cpuPredictor;
+   orlib::Regressor<double> *gpuPredictor;
+#endif
+   GPUExecutionMode::executionMode execMode;
+   std::mutex mutexLock;
+};
+
+// Utility functions
+
+static ProfilingHashTable* getProfileHashTable(GpuMetaData* gpuMetaData, int kernelId)
+   {
+   return (ProfilingHashTable*)gpuMetaData->profileData[kernelId];
+   }
+
+static ProfilingHashTable* getOrAllocProfileHashTable(GpuMetaData* gpuMetaData, int kernelId)
+   {
+   ProfilingHashTable* profileData = getProfileHashTable(gpuMetaData, kernelId);
+   if (!profileData)
+      {
+      void* profileMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(ProfilingHashTable), TR_Memory::GPUHelpers);
+      gpuMetaData->profileData[kernelId] = profileMem;
+      profileData = new ((ProfilingHashTable*)profileMem) ProfilingHashTable();
+      }
+   return profileData;
+   }
+
+static GPUProfilingTable* getGPUProfilingTable(GpuMetaData* gpuMetaData, int kernelId)
+   {
+   return (GPUProfilingTable*)gpuMetaData->gpuAsyncProfiler[kernelId];
+   }
+
+static GPUProfilingTable* getOrAllocGPUProfilingTable(GpuMetaData* gpuMetaData, int kernelId)
+   {
+   GPUProfilingTable* gpuProfTable = getGPUProfilingTable(gpuMetaData, kernelId);
+   if (!gpuProfTable)
+       {
+       void* profileMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(GPUProfilingTable), TR_Memory::GPUHelpers);
+       gpuMetaData->gpuAsyncProfiler[kernelId] = profileMem;
+       gpuProfTable = new ((GPUProfilingTable*)profileMem) GPUProfilingTable();
+       }
+   return gpuProfTable;
+   }
+#endif
+
 struct CudaInfo {
 public:
    CudaInfo() : module(0), kernel(0) {}
@@ -744,6 +1172,18 @@ public:
    CUresult    ffdcCuError;
    cudaError_t ffdcCudaError;
    bool        sessionFailed; 
+
+#ifdef ENABLE_GPU_PROFILING
+   // profiling data structures
+   double             cpuTime;
+   double             gpuTime;
+   int                profileKey;
+   int                profilingSafe;
+   ProfilingHashTable*  profileData;
+   GPUProfilingTable* profileTable;
+   // for state transitions between normal and profiling mode
+   GPUExecutionMode::executionMode exeMode;
+#endif
 };
 
 #define returnOnTrue(result,errorCode) \
@@ -1098,6 +1538,10 @@ initCUDA(J9VMThread *vmThread, int tracing, const char *ptxSource, int deviceId,
       return 0;
       }
    memset(cudaInfo->hashTable, 0, cudaInfo->hashSize * sizeof(HashEntry));
+
+#ifdef ENABLE_GPU_PROFILING
+   cudaInfo->exeMode = GPUExecutionMode::normal;
+#endif
 
    double startTime, deviceSetTime, contextSetupTime;
    startTime = currentTime();
@@ -1486,7 +1930,12 @@ generatePTX(int tracing, const char *programSource, int deviceId, TR::Persistent
 static TR::CodeGenerator::GPUResult
 launchKernel(int tracing, CudaInfo *cudaInfo, int gridDimX, int gridDimY, int gridDimZ, 
                                          int blockDimX, int blockDimY, int blockDimZ,
-                                         int argCount, bool needExtraArg, void** args, int kernelID, int hasExceptionChecks)
+                                         int argCount, bool needExtraArg, void** args, int kernelID, int hasExceptionChecks
+#ifndef ENABLE_GPU_PROFILING
+   )
+#else
+   , long range,  GpuMetaData* gpuMetaData)
+#endif
    {
    TR::CodeGenerator::GPUResult ExceptionKind = TR::CodeGenerator::GPUSuccess;
    double time;
@@ -1546,6 +1995,32 @@ launchKernel(int tracing, CudaInfo *cudaInfo, int gridDimX, int gridDimY, int gr
       TR_VerboseLog::writeLine(TR_Vlog_GPU, "_args: %p",_args);
       }
    time = currentTime();
+
+#ifdef ENABLE_GPU_PROFILING
+   GPUProfilingTableEntry* entry = NULL;
+   if (cudaInfo->exeMode == GPUExecutionMode::profiling)
+      {
+      entry = (GPUProfilingTableEntry*) TR_Memory::jitPersistentAlloc(sizeof(GPUProfilingTableEntry), TR_Memory::GPUHelpers);
+      entry->kernelID = kernelID;
+      entry->range = range;
+      entry->next = NULL;
+      GPUProfilingTable* parentTable = getOrAllocGPUProfilingTable(gpuMetaData, kernelID);
+      entry->parent = parentTable;
+      // allocate start and stop events
+      jitCudaEventCreate(&entry->start, cudaEventDefault);
+      jitCudaEventCreate(&entry->end, cudaEventDefault);
+      jitCudaEventCreate(&entry->finish, cudaEventDefault);
+      // put start event here
+      if (stream == NULL)
+         {
+            jitCudaEventRecord(entry->start, 0);
+         }
+      else
+         {
+            jitCudaEventRecord(entry->start, stream);
+         }
+      }
+#endif
    
    returnOnTrue(captureCuError(jitCuLaunchKernel(
                                   cudaInfo->kernel,
@@ -1554,7 +2029,7 @@ launchKernel(int tracing, CudaInfo *cudaInfo, int gridDimX, int gridDimY, int gr
                                   0, stream, _args, NULL),
                                   cudaInfo, "launchKernel - jitCuLaunchKernel"),
                                   TR::CodeGenerator::GPUHelperError);  // TODO: used to be GPULaunchError
-
+#ifndef ENABLE_GPU_PROFILING
    if (tracing > 1)
       {
       if (stream == NULL)
@@ -1583,7 +2058,76 @@ launchKernel(int tracing, CudaInfo *cudaInfo, int gridDimX, int gridDimY, int gr
          returnOnTrue(captureCudaError(jitCudaStreamSynchronize(stream), cudaInfo, "launchKernel - jitCudaStreamSynchronize"), TR::CodeGenerator::GPUHelperError);
          }
       }
+#else
+   if (cudaInfo->exeMode == GPUExecutionMode::normal)
+       {
+           if (tracing > 1)
+               {
+               if (stream == NULL)
+                  jitCudaDeviceSynchronize();
+               else
+                  jitCudaStreamSynchronize(stream);
+                  TR_VerboseLog::writeLine(TR_Vlog_GPU, "\tcuLaunchKernel: %.3f msec.", (currentTime() - time)/1000);
+               }
 
+           if (hasExceptionChecks)
+               {
+               returnOnTrue(captureCuError(!disableAsyncOps ? jitCuMemcpyDtoHAsync(&ExceptionKind, cudaInfo->exceptionPointer, sizeof(int32_t), stream)
+                                           : jitCuMemcpyDtoH(&ExceptionKind, cudaInfo->exceptionPointer, sizeof(int32_t)),
+                                           cudaInfo, "launchKernel - jitCuMemcpyDtoH"), TR::CodeGenerator::GPUHelperError);
+
+               if (tracing > 1)
+                  TR_VerboseLog::writeLine(TR_Vlog_GPU,"\tCopy out %d bytes for exceptions. Device: %p (%p)", sizeof(int32_t), cudaInfo->exceptionPointer, cudaInfo);
+               if (disableAsyncOps)
+                  {
+                  returnOnTrue(captureCudaError(jitCudaDeviceSynchronize(), cudaInfo, "launchKernel - jitCudaDeviceSynchronize"), TR::CodeGenerator::GPUHelperError);
+                  }
+               else
+                   {
+                   returnOnTrue(captureCudaError(jitCudaStreamSynchronize(stream), cudaInfo, "launchKernel - jitCudaStreamSynchronize"), TR::CodeGenerator::GPUHelperError);
+                   }
+               }
+       }
+   if (cudaInfo->exeMode == GPUExecutionMode::profiling)
+       {
+       entry->hasExceptionChecks = hasExceptionChecks;
+       if (hasExceptionChecks)
+          {
+          // Copy back exception kind
+          TR::CodeGenerator::GPUResult* ExceptionKindRetPtr;
+          ExceptionKindRetPtr = (TR::CodeGenerator::GPUResult*)malloc(sizeof(TR::CodeGenerator::GPUResult));
+          *ExceptionKindRetPtr = TR::CodeGenerator::GPUSuccess;
+          entry->ExceptionKind = ExceptionKindRetPtr;
+          returnOnTrue(captureCuError(!disableAsyncOps ? jitCuMemcpyDtoHAsync(ExceptionKindRetPtr, cudaInfo->exceptionPointer, sizeof(int32_t), stream)
+                                      : jitCuMemcpyDtoH(ExceptionKindRetPtr, cudaInfo->exceptionPointer, sizeof(int32_t)),
+                                      cudaInfo, "launchKernel"), TR::CodeGenerator::GPUHelperError);
+
+          if (tracing > 1)
+             {
+             TR_VerboseLog::writeLine(TR_Vlog_GPU,"\tCopy out %d bytes for exceptions. Device: %p (%p)", sizeof(int32_t), cudaInfo->exceptionPointer, cudaInfo);
+             }
+          }
+
+          // CUDA stream at this point
+          // If hasExceptionChecks == true : startEvent -> kernel -> D2H (exception)
+          // else                          : startEvent -> kernel
+          if (stream == NULL)
+             {
+             jitCudaEventRecord(entry->end, 0);
+             jitCudaStreamAddCallback(0, profilingCallback, entry, 0);
+             jitCudaEventRecord(entry->finish, 0);
+             }
+          else
+             {
+             jitCudaEventRecord(entry->end, stream);
+             jitCudaStreamAddCallback(stream, profilingCallback, entry, 0);
+             jitCudaEventRecord(entry->finish, stream);
+             }
+          // CUDA stream at this point
+          // If hasExceptionChecks == true : startEvent -> kernel -> D2H (exception) -> endEvent -> callback -> finishEvent
+          // else                          : startEvent -> kernel                    -> endEvent -> callback -> finishEvent
+       }
+#endif
    if (needExtraArg)
       {
       free(_args);
@@ -1597,6 +2141,128 @@ launchKernel(int tracing, CudaInfo *cudaInfo, int gridDimX, int gridDimY, int gr
 
 int flushGPUDatatoCPU(CudaInfo *cudaInfo);
 bool freeGPUScope(CudaInfo *cudaInfo);
+
+#ifdef ENABLE_GPU_PROFILING
+// helper function for deciding whether the current loop should run which device.
+int scheduleGPU(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC, int range)
+   {
+   returnOnTrue(!cudaInfo,0); // if cudaInfo is not defined, there is an error condition so pass through
+                              // to enable the error handler to kick in
+
+   char *methodSignature;
+   int lineNumber;
+   int trace = cudaInfo->tracing;
+
+   GpuMetaData* gpuMetaData = getGPUMetaData(startPC);
+
+   cudaInfo->profileKey  = range;
+   //cudaInfo->profilingSafe = isProfilingSafe;
+   cudaInfo->profilingSafe = true;
+
+   GPUProfilingTable* profileTable = getGPUProfilingTable(gpuMetaData, kernelId);
+   ProfilingHashTable* profileData = getProfileHashTable(gpuMetaData, kernelId);
+
+   // Moving to profiling mode if there is no profiling data
+   if (!profileData)
+      {
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Transition : NORMAL->PROFILING", kernelId);
+      profileData = getOrAllocProfileHashTable(gpuMetaData, kernelId);
+      cudaInfo->exeMode = GPUExecutionMode::profiling;
+      }
+   else
+      {
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d State : %s", kernelId, (profileData->getCurrentExeMode() == GPUExecutionMode::profiling)? "PROFILING" : "NORMAL");
+      cudaInfo->exeMode = profileData->getCurrentExeMode();
+      }
+
+   if (cudaInfo->exeMode == GPUExecutionMode::profiling)
+      {
+      // See if there are any finished kernels with the profiler enabled
+      if (profileTable)
+          {
+          // Get one entry
+          GPUProfilingTableEntry *profileTableEntry = profileTable->getEntry(kernelId);
+          float elapsedGPUTime = 0.0f;
+          float elapsedOverheadTime = 0.0f;
+          bool newSampleAdded = false;
+          while (profileTableEntry)
+             {
+             newSampleAdded = true;
+             jitCudaEventElapsedTime(&elapsedGPUTime, profileTableEntry->start, profileTableEntry->end);
+#ifdef PROFILING_LOWLEVEL_DEBUG
+             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Adding a new GPU time entry @ estimateGPU(): time:%.3f msec", kernelId, elapsedGPUTime);
+#endif
+             profileData = getOrAllocProfileHashTable(gpuMetaData, kernelId);
+             // Update mean GPU time in the profiling storage
+             profileData->updateGPUEntry(range, elapsedGPUTime);
+#ifdef PROFILING_LOWLEVEL_DEBUG
+             // Only for overhead analysis purpose
+             jitCudaEventElapsedTime(&elapsedOverheadTime, profileTableEntry->end, profileTableEntry->finish);
+             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Callback overhead was %.3f msec", elapsedOverheadTime);
+#endif
+             // Remove the entry from the profiling table
+             profileTable->removeEntry(profileTableEntry);
+             // Look for the next entry
+             profileTableEntry = profileTable->getEntry(kernelId);
+             }
+          if (newSampleAdded)
+             {
+             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Trying to see if we can exit from the profling mode (range %d)" , kernelId, range);
+		     GPUExecutionMode::executionMode nextState = profileData->getNextExeMode(range);
+             if (nextState == GPUExecutionMode::normal)
+                {
+                TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Transition : PROFILING->NORMAL", kernelId);
+                TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Transition : Invalidating GPU data", kernelId);
+                cudaInfo->exeMode = GPUExecutionMode::normal;
+                // invalidate
+                for (int32_t i = 0; i < cudaInfo->hashSize; i++)
+                   {
+                   if (cudaInfo->hashTable[i].hostRef != 0
+                       && cudaInfo->hashTable[i].hostRef != (void **)DELETED_HOSTREF
+                       && cudaInfo->hashTable[i].deviceArray != NULL_DEVICE_PTR
+                       && cudaInfo->hashTable[i].deviceArray != BAD_DEVICE_PTR
+                       && cudaInfo->hashTable[i].valid)
+                      {
+                      cudaInfo->hashTable[i].valid = false; // invalidate GPU data
+                      }
+                   }
+                }
+             else
+                {
+                TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Continue PROFILING", kernelId);
+                return 0; // Run GPU with Profiling Enabled
+                }
+             }
+          else
+             {
+             // There is profiling data, but no new sample
+             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] No new GPU profiling sample found ", kernelId);
+             return 0;
+             }
+          }
+      else
+          {
+          // There is no GPU profiling data (profileTable)
+          return 0; // Run GPU with Profiling Enabled
+          }
+      }
+
+   if (cudaInfo->exeMode == GPUExecutionMode::normal)
+      {
+      bool directToGPU = profileData->gpuIsFaster(range, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      if (directToGPU)
+         {
+         TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Decision : GPU");
+         return 0; // GPU
+         }
+      else
+         {
+         TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Decision : CPU");
+         return 1; // CPU
+         }
+      }
+   }
+#endif
 
 extern "C" int
 estimateGPU(CudaInfo *cudaInfo, int ptxSourceID, uint8_t *startPC, int lambdaCost, int dataSize, int startInclusive, int endExclusive)
@@ -1624,6 +2290,9 @@ estimateGPU(CudaInfo *cudaInfo, int ptxSourceID, uint8_t *startPC, int lambdaCos
       TR_VerboseLog::writeLine(TR_Vlog_GPU, "\tforEach in %s at line %d has lambdaCost %d dataCost %d range %lld ratio %d", methodSignature, lineNumber, lambdaCost, dataCost, range, dataCost/range);
       }
 
+#ifdef ENABLE_GPU_PROFILING
+   return scheduleGPU(cudaInfo, ptxSourceID, startPC, range);
+#endif
 
    bool directToCPU = ((cudaInfo->availableMemory < (unsigned long long)dataSize) || lambdaCost == 0 || dataCost/range > 80 || range < 1024);
 
@@ -2350,6 +3019,15 @@ getStateGPU(CudaInfo *cudaInfo, uint8_t *startPC)
       }
    else
       {
+#ifdef ENABLE_GPU_PROFILING
+      if (cudaInfo->exeMode == GPUExecutionMode::profiling)
+         {
+         if (tracing > 1)
+            TR_VerboseLog::writeLine(TR_Vlog_GPU,"[Profiling] getStateGPU called: session speculative profiling (%p)",cudaInfo);
+            cudaInfo->cpuTime = currentTime();
+            return GPU_EXEC_SUCCESS_PROFILING;
+         }
+#endif
       if (tracing > 1)
          TR_VerboseLog::writeLine(TR_Vlog_GPU,"\tgetStateGPU called: session successful (%p)",cudaInfo);
       
@@ -2372,10 +3050,34 @@ getStateGPU(CudaInfo *cudaInfo, uint8_t *startPC)
 extern "C" int
 registerCPUTime(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC)
    {
+   returnOnTrue(!cudaInfo,NULL_DEVICE_PTR);
+   returnOnTrue(cudaInfo->exeMode != GPUExecutionMode::profiling,0);
+
    int tracing = cudaInfo->tracing;
    if (tracing > 1)
        TR_VerboseLog::writeLine(TR_Vlog_GPU,"\tregisterCPUTime called (%p)", cudaInfo);
-   return true;
+
+   GpuMetaData* gpuMetaData = getGPUMetaData(startPC);
+   ProfilingHashTable* profileData = getProfileHashTable(gpuMetaData, kernelId);
+
+   double cpuTimeMeasure = (currentTime() - cudaInfo->cpuTime)/1000;
+   profileData->updateCPUEntry(cudaInfo->profileKey,cpuTimeMeasure);
+
+   // releasing resources now since we're in profiling mode
+   //  and resource release was delayed until after profiling
+   //  was completed.
+   if (cudaInfo->regionType == TR::CodeGenerator::singleKernelScope)
+      {
+          // the original implementation releases resource here
+          // because it does not perform D2H transfers
+          // since we plan to profile D2H transfers,
+          // comment out this for now.
+          // return freeGPUScope(cudaInfo);
+      }
+   else
+      {
+      return true;
+      }
    }
 #endif
 
@@ -2466,7 +3168,12 @@ extern "C" int launchGPUKernel(CudaInfo *cudaInfo, int startInclusive, int endEx
 
    time = currentTime();
    result = launchKernel(tracing, cudaInfo, gridDimX, gridDimY, gridDimZ,
-                         blockDimX, blockDimY, blockDimZ, argCount, false, args, kernelId, hasExceptionChecks);
+                         blockDimX, blockDimY, blockDimZ, argCount, false, args, kernelId, hasExceptionChecks
+#ifndef ENABLE_GPU_PROFILING
+                         );
+#else
+                         , range, getGPUMetaData(startPC));
+#endif
 
    if (tracing > 1)
       {
