@@ -1308,6 +1308,7 @@ TR::Register *TR::AMD64JNILinkage::buildDirectDispatch(
                                                  callSymRef->getReferenceNumber() == TR_copyFromGPU ||
                                                  callSymRef->getReferenceNumber() == TR_invalidateGPU ||
                                                  callSymRef->getReferenceNumber() == TR_flushGPU ||
+                                                 callSymRef->getReferenceNumber() == TR_registerCPUTime ||
                                                  callSymRef->getReferenceNumber() == TR_regionExitGPU);
    if (callSymbol->isJNI() || isGPUHelper)
       {

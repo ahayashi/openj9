@@ -277,6 +277,9 @@ class TR_SPMDKernelParallelizer : public TR_LoopTransformer
    void insertGPUParmsAllocate(TR::Node *firstNode, TR::Block *allocateParmsBlock, TR::SymbolReference *allocSymRef, TR::SymbolReference *launchSymRef);
    void insertGPUInvalidateSequence(TR::Node *firstNode, TR::Block *invalidateGPUBlock, TR::SymbolReference *initSymRef);
    void insertGPUErrorHandler(TR::Node *firstNode, TR::Block *errorHandleBlock, TR::SymbolReference *initSymRef, TR::Block* recoveryBlock);
+#ifdef ENABLE_GPU_PROFILING
+   void insertRegisterCPUTimeCall(TR::Block* block, TR::SymbolReference *scopeSymRef);
+#endif
    void insertGPUKernelExit(TR::Node *firstNode, TR::Block *kernelExitGPUBlock, TR::SymbolReference *initSymRef, TR::SymbolReference *launchSymRef);
    void insertGPUCopyFromSequence(TR::Node *firstNode, TR::Block *copyFromGPUBlock, TR::SymbolReference *initSymRef, TR::SymbolReference *launchSymRef, TR_PrimaryInductionVariable *piv);
    void insertGPUCopyToSequence(TR::Node *firstNode, TR::Block *copyToGPUBlock, TR::SymbolReference *initSymRef, TR_PrimaryInductionVariable *piv);

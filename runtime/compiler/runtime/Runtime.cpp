@@ -239,6 +239,7 @@ JIT_HELPER(invalidateGPU);
 JIT_HELPER(getStateGPU);
 JIT_HELPER(flushGPU);
 JIT_HELPER(callGPU);
+JIT_HELPER(registerCPUTime);
 
 #ifdef TR_HOST_X86
 
@@ -1029,6 +1030,7 @@ void initializeCodeRuntimeHelperTable(J9JITConfig *jitConfig, char isSMP)
    SET(TR_getStateGPU,                (void *)getStateGPU,               TR_Helper);
    SET(TR_flushGPU,                   (void *)flushGPU,                  TR_Helper);
    SET(TR_callGPU,                    (void *)callGPU,                   TR_Helper);
+   SET(TR_registerCPUTime,            (void *)registerCPUTime,           TR_Helper);
 
 #if defined(TR_HOST_X86) || defined(TR_HOST_POWER)
    SET(TR_referenceArrayCopy,         (void *)jitReferenceArrayCopy,     TR_Helper);

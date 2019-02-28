@@ -2293,6 +2293,54 @@ void TR_SPMDKernelParallelizer::insertGPUErrorHandler(TR::Node *firstNode, TR::B
    cfg->addEdge(errorHandleBlock,recoveryBlock);
    }
 
+#ifdef ENABLE_GPU_PROFILING
+// generate resgisterCPUTime runtime helpler calls
+// insert it into all predecessor blocks of the code called after GPU function completion
+void TR_SPMDKernelParallelizer::insertRegisterCPUTimeCall(TR::Block* next, TR::SymbolReference *scopeSymRef)
+    {
+    next = toBlock(next->getSuccessors().front()->getTo());
+
+    TR::SymbolReference *helper;
+    TR::ILOpCodes addressLoadOpCode = TR::lload;
+    int gpuPtxId = comp()->getGPUPtxCount()-1;
+
+    List<TR::CFGEdge> edges(comp()->trMemory());
+    for (auto predecessor = next->getPredecessors().begin(); predecessor != next->getPredecessors().end(); ++predecessor) {
+        edges.add(*predecessor);
+    }
+
+    ListIterator<TR::CFGEdge> bi(&edges);
+    TR::CFGEdge *edge;
+
+    for (edge = bi.getFirst(); edge; edge = bi.getNext())
+        {
+            TR::Block* prev = toBlock(edge->getFrom());
+            TR::Block* profileCallBlock = prev->splitEdge(prev, next, comp());
+
+            TR::TreeTop *insertionPoint = profileCallBlock->getEntry();
+            TR::Node* profilerCallNode = TR::Node::create(insertionPoint->getNode(), TR::icall, 3);
+
+            helper = comp()->getSymRefTab()->findOrCreateRuntimeHelper(TR_registerCPUTime, false, false, false);
+            helper->getSymbol()->castToMethodSymbol()->setLinkage(_helperLinkage);
+            profilerCallNode->setSymbolReference(helper);
+
+            // *cudaInfo
+            profilerCallNode->setAndIncChild(0, TR::Node::createWithSymRef(profilerCallNode, addressLoadOpCode, 0, scopeSymRef));
+
+            // ptxSourceID
+            profilerCallNode->setAndIncChild(1, TR::Node::create(profilerCallNode, TR::iconst, 0, gpuPtxId));
+
+            // startPC
+            profilerCallNode->setAndIncChild(2, TR::Node::createWithSymRef(profilerCallNode, TR::loadaddr, 0, comp()->getSymRefTab()->findOrCreateStartPCSymbolRef()));
+
+            TR::Node *treetopNode = TR::Node::create(TR::treetop, 1, profilerCallNode);
+            TR::TreeTop *initTreeTop = TR::TreeTop::create(comp(), treetopNode, 0, 0);
+
+            insertionPoint->insertAfter(initTreeTop);
+        }
+    }
+#endif
+
 // generates a copyfrom sequence.
 void TR_SPMDKernelParallelizer::insertGPUCopyFromSequence(TR::Node *firstNode, TR::Block *copyFromGPUBlock, TR::SymbolReference *scopeSymRef, TR::SymbolReference *launchSymRef, TR_PrimaryInductionVariable *piv)
    {
@@ -3197,7 +3245,11 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
 
    if (!comp()->getOptions()->getEnableGPU(TR_EnableGPUForce))
    {
+#ifndef ENABLE_GPU_PROFILING
    cfg->addEdge(estimateBlock, origLoopBlock);
+#else
+   cfg->addEdge(estimateBlock, lambdaCPUBlock);
+#endif
    }
 
    cfg->addEdge(gotoBlock, blockAfterLoop);
@@ -3327,7 +3379,12 @@ bool TR_SPMDKernelParallelizer::processGPULoop(TR_RegionStructure *loop, TR_SPMD
 
    if (!comp()->getOptions()->getEnableGPU(TR_EnableGPUForce))
       {
+#ifndef ENABLE_GPU_PROFILING
       insertGPUEstimate(firstNode, estimateBlock, lambdaCost, dataCost, piv, loopTestTree, origLoopBlock, loopInvariantBlock, scopeSymRef);
+#else
+      insertGPUEstimate(firstNode, estimateBlock, lambdaCost, dataCost, piv, loopTestTree, lambdaCPUBlock, loopInvariantBlock, scopeSymRef);
+      insertRegisterCPUTimeCall(blockAfterLoop, scopeSymRef);
+#endif
       }
 
 

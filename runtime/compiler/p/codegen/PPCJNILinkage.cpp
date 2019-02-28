@@ -126,6 +126,7 @@ TR::Register *TR::PPCJNILinkage::buildDirectDispatch(TR::Node *callNode)
                                                  callSymRef->getReferenceNumber() == TR_copyFromGPU ||
                                                  callSymRef->getReferenceNumber() == TR_invalidateGPU ||
                                                  callSymRef->getReferenceNumber() == TR_regionExitGPU ||
+                                                 callSymRef->getReferenceNumber() == TR_registerCPUTime ||
                                                  callSymRef->getReferenceNumber() == TR_flushGPU);
 
 

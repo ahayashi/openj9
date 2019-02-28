@@ -2368,6 +2368,16 @@ getStateGPU(CudaInfo *cudaInfo, uint8_t *startPC)
    return returnValue;
    }
 
+#ifdef ENABLE_GPU_PROFILING
+extern "C" int
+registerCPUTime(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC)
+   {
+   int tracing = cudaInfo->tracing;
+   if (tracing > 1)
+       TR_VerboseLog::writeLine(TR_Vlog_GPU,"\tregisterCPUTime called (%p)", cudaInfo);
+   return true;
+   }
+#endif
 
 // NUMEXTRAPARMS is set to 3. 2 extra parms for loop range and 1 extra parm is for exceptionKind in launchKernel.
 #define NUMEXTRAPARMS    3
@@ -2525,6 +2535,7 @@ extern "C" int invalidateGPU () { return 0; }
 extern "C" int flushGPU () { return 0; }
 extern "C" int copyToGPU () { return 0; }
 extern "C" int copyFromGPU () { return 0; }
+extern "C" int registerCPUTime() { return 0; }
 extern "C" void** allocateGPUKernelParms () { return 0; }
 extern "C" int launchGPUKernel () { return 0; }
 extern "C" int regionEntryGPU () { return 0; }
