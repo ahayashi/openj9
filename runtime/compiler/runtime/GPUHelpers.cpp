@@ -741,8 +741,14 @@ struct HashEntry
 // The size of ProfilingHashTable
 #define NUM_PROF_SAMPLES 128
 
+//
+#define PROFILING_THRESHOLD 15
+
 // For state transitions between normal and profiling mode.
 namespace GPUExecutionMode { enum executionMode { normal, profiling }; };
+
+//
+namespace Selection { enum device { undecided, cpu, gpu}; };
 
 // GPUProfilingTable is used
 // for measuring GPU time using CUDA events and callbacks.
@@ -892,6 +898,79 @@ void CUDART_CB profilingCallback(cudaStream_t stream, cudaError_t status, void *
       }
    }
 
+// Passive Aggressive Regressor
+template <typename T>
+class PARegressor {
+public:
+   PARegressor(T _C = (T)1.0, T _epsilon = (T)0.01) :
+      C(_C), epsilon(_epsilon)
+      {
+      w1 = 0.0;
+      w0 = 0.0;
+      }
+
+   T hinge_loss(T diff)
+      {
+      T error = (diff > 0)? diff : -diff;
+      T loss;
+      if (error <= epsilon)
+         {
+         loss = (T)0;
+         }
+      else
+         {
+         loss = error - epsilon;
+         }
+      return loss;
+      }
+
+   void update(T diff, T tau, T x)
+      {
+      T sign;
+      if (diff > 0)
+         {
+         sign = (T)1.0;
+         }
+      else if (diff == 0)
+         {
+         sign = (T)0.0;
+         }
+      else
+         {
+         sign = (T)1.0;
+         }
+      w1 += sign * tau * x;
+      w0 += sign * tau * 1.0;
+      }
+
+   void train(T x, T val)
+      {
+      T diff;
+      diff = val - predict(x);
+      T loss = hinge_loss(diff);
+      if (loss != (T)0)
+         {
+         T norm = x * x + (T)1.0;
+         T tau = loss / (T)(norm + ((T)1.0/(T)2.0*C));
+         update(diff, tau, x);
+         }
+      }
+
+   T predict(T x)
+      {
+      return w1 * x + w0;
+      }
+
+   void dump()
+      {
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Dumping regressor: w1 = %lf, w0 = %lf", w1, w0);
+      }
+private:
+   T w1, w0;
+   T C;
+   T epsilon;
+};
+
 // [Profiling Storage Entry (Per Range)]
 // ProfilingStorageEntry stores historical CPU and GPU execution timings
 // with a specific loop range and kernel.
@@ -899,21 +978,126 @@ void CUDART_CB profilingCallback(cudaStream_t stream, cudaError_t status, void *
 // are updated incrementally.
 struct ProfilingStorageEntry {
 public:
+   int parallelCount;
+   Selection::device decision;
+
+   ProfilingStorageEntry()
+      {
+      cpuMean = 0.0;
+      gpuMean = 0.0;
+      cpuSampleVariance = 0.0;
+      gpuSampleVariance = 0.0;
+      cpuSampleStddev = 0.0;
+      gpuSampleStddev = 0;
+      numCPUSamplesObserved = 0;
+      numGPUSamplesObserved = 0;
+      t_value = 0.0;
+      dof = 0.0;
+      parallelCount = -1;
+      decision = Selection::undecided;
+      }
+
+   void addCPUTime(double cpuTime)
+      {
+      // update average gpu time
+      double n = numCPUSamplesObserved + 1;
+      double m = cpuMean;
+      double s = cpuSampleVariance;
+      double x = cpuTime;
+
+      // update the statistics iteratively
+      cpuMean = ((n-1) * m + x) / n;
+      cpuSampleVariance = (n == 1)? 0 : (((n-2) * s ) / (n-1)) + (x - m) * (x - m) / n;
+      cpuSampleStddev = sqrt(cpuSampleVariance);
+      numCPUSamplesObserved++;
+
+      makeDecision();
+      }
+
+   void addGPUTime(double gpuTime)
+      {
+      // update average gpu time
+      double n = numGPUSamplesObserved + 1;
+      double m = gpuMean;
+      double s = gpuSampleVariance;
+      double x = gpuTime;
+
+      // update the statistics iteratively
+      gpuMean = ((n-1) * m + x) / n;
+      gpuSampleVariance = (n == 1)? 0 : (((n-2) * s ) / (n-1)) + (x - m) * (x - m) / n;
+      gpuSampleStddev = sqrt(gpuSampleVariance);
+      numGPUSamplesObserved++;
+
+      makeDecision();
+      }
+
+    double getCPUMean()
+       {
+       return cpuMean;
+       }
+
+    double getGPUMean()
+       {
+       return gpuMean;
+       }
+
+    void dump()
+       {
+       TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Dumping ProfilingStorageEntry (range %d):", parallelCount);
+       TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] CPU = {u = %.3f, s = %.3f, n = %d}", cpuMean, cpuSampleStddev, numCPUSamplesObserved);
+       TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] GPU = {u = %.3f, s = %.3f, n = %d}", gpuMean, gpuSampleStddev, numGPUSamplesObserved);
+       TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] t_value = %.3f, dof = %.3f, decision = %s", t_value, dof, (decision == Selection::undecided)? "UNDECIDED" : (decision == Selection::cpu)? "CPU" : "GPU");
+       }
+
+private:
+   double tdist[31] = {0, 12.706, 4.3027, 3.1825, 2.7764, 2.5706, 2.4469, 2.3646, 2.3060, 2.2622, 2.2281, 2.2010, 2.1788, 2.1604, 2.1448, 2.1315, 2.1199, 2.1098, 2.1009, 2.0930, 2.0860, 2.0796, 2.0739, 2.0687, 2.0639, 2.0595, 2.0555, 2.0518, 2.0484, 2.0452, 2.0423};
+
+   void makeDecision()
+      {
+      double uc = cpuMean;
+      double ug = gpuMean;
+      double sc2 = cpuSampleVariance;
+      double sg2 = gpuSampleVariance;
+      int nc = numCPUSamplesObserved;
+      int ng = numGPUSamplesObserved;
+
+      // t-value
+      t_value = (uc - ug) / sqrt(sc2/(double)nc + sg2/(double)ng);
+
+      // DOF
+      double tmp = sc2/(double)nc + sg2/(double)ng;
+      dof = (tmp*tmp) / ((sc2*sc2) / (nc*nc*(nc-1)) + (sg2*sg2) / (ng*ng*(ng-1)));
+
+      // perform Welch's T-test
+      if (dof > 0 && dof < 31)
+            {
+            int idof = (int)dof;
+            if (tdist[idof] <= t_value)
+               {
+               // CPU is significantly larger than GPU
+               decision = Selection::gpu;
+               }
+            else if (numCPUSamplesObserved > PROFILING_THRESHOLD)
+               {
+               // With PROFILING_THRESHOLD samples there is no evidence that GPU is significantly faster than GPU
+               decision = Selection::cpu;
+               }
+            }
+      }
+
    double cpuMean;             // CPU Mean
    double gpuMean;             // GPU Mean
-   double cpuSampleVariance;         // CPU Variance
-   double gpuSampleVariance;         // GPU Variance
-   double cpuSampleStddev;           // CPU Stddev
-   double gpuSampleStddev;           // GPU Stddev
+   double cpuSampleVariance;   // CPU Variance
+   double gpuSampleVariance;   // GPU Variance
+   double cpuSampleStddev;     // CPU Stddev
+   double gpuSampleStddev;     // GPU Stddev
    double t_value;             // t-value
    double dof;                 // degree of freedom
    int numCPUSamplesObserved;
    int numGPUSamplesObserved;
-
-   int parallelCount;
 };
 
-// [Profiling Storage (Per Range)]
+// [Profiling Storage (Per Kernel)]
 // Profiling Storage is a hash table of ProfilingStorageEntry
 // Also, this allows the runtime to decide to whether to use GPU with historical CPU and GPU execution timings.
 class ProfilingHashTable {
@@ -922,28 +1106,19 @@ public:
    ProfilingHashTable()
       {
       TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Initializing ProfilingHashTable with %d entries", NUM_PROF_SAMPLES);
-      // initialize the list
-      int32_t i = 0;
-      for (; i < NUM_PROF_SAMPLES; i++)
-         {
-         profileStorage[i].cpuMean = 0.0;
-         profileStorage[i].gpuMean = 0.0;
-         profileStorage[i].cpuSampleVariance = 0.0;
-         profileStorage[i].gpuSampleVariance = 0.0;
-         profileStorage[i].cpuSampleStddev = 0.0;
-         profileStorage[i].gpuSampleStddev = 0;
-         profileStorage[i].numCPUSamplesObserved = 0;
-         profileStorage[i].numGPUSamplesObserved = 0;
-         profileStorage[i].t_value = 0.0;
-         profileStorage[i].dof = 0.0;
-         profileStorage[i].parallelCount = -1;
-         }
       execMode = GPUExecutionMode::profiling;
       initPredictors();
       }
 
    void initPredictors()
       {
+      void* cpuRegressorMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(PARegressor<double>), TR_Memory::GPUHelpers);
+      void* gpuRegressorMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(PARegressor<double>), TR_Memory::GPUHelpers);
+      cpuPredictor = new ((PARegressor<double>*)cpuRegressorMem)PARegressor<double>();
+      gpuPredictor = new ((PARegressor<double>*)gpuRegressorMem)PARegressor<double>();
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Regressor Algorithm : Passive Aggressive");
+      cpuR2value = 0.0;
+      gpuR2value = 0.0;
       }
 
    GPUExecutionMode::executionMode getCurrentExeMode()
@@ -954,39 +1129,55 @@ public:
    // Suggest a preferrable execution mode by looking at current CPU and GPU timings information.
    GPUExecutionMode::executionMode getNextExeMode(int parallelCount)
       {
+      ProfilingStorageEntry *entry = getEntry(parallelCount);
       GPUExecutionMode::executionMode nextMode = execMode;
+      switch (execMode)
+          {
+          case GPUExecutionMode::profiling:
+              {
+              if (entry)
+                 {
+                 // known range
+                 if (entry->decision != Selection::undecided)
+                    {
+                    nextMode = GPUExecutionMode::normal;
+                    }
+                 }
+              else
+                 {
+                 // unknown range, let's see if the predictor is accurate
+                 if (isPredictorAccurate())
+                    {
+                    nextMode = GPUExecutionMode::normal;
+                    }
+                 }
+                 break;
+              }
+          case GPUExecutionMode::normal:
+              {
+              nextMode = GPUExecutionMode::normal;
+              break;
+              }
+          }
+      execMode = nextMode;
       return nextMode;
       }
 
-   // Update the GPU timings
-   void updateGPUEntry(int parallelCount, double gpuTime)
+   // Update the CPU timings
+   void updateCPUEntry(int parallelCount, double cpuTime)
       {
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Updating CPU ProfilingStorage entry (range: %d, time: %.4f msec)", parallelCount, cpuTime);
       mutexLock.lock();
-      ProfilingStorageEntry* profDataPtr = getOrAllocEntry(parallelCount);
-      if (profDataPtr != NULL)
+      ProfilingStorageEntry* entry = getOrAllocEntry(parallelCount);
+      if (entry != NULL)
          {
-         // update average gpu time
-         double n = profDataPtr->numGPUSamplesObserved + 1;
-         double m = profDataPtr->gpuMean;
-         double s = profDataPtr->gpuSampleVariance;
-         double x = gpuTime;
-
-         // update the statistics iteratively
-         profDataPtr->gpuMean = ((n-1) * m + x) / n;
-         profDataPtr->gpuSampleVariance = (n == 1)? 0 : (((n-2) * s ) / (n-1)) + (x - m) * (x - m) / n;
-         profDataPtr->gpuSampleStddev = sqrt(profDataPtr->gpuSampleVariance);
-         profDataPtr->numGPUSamplesObserved++;
-
          //
-         profDataPtr->t_value = computeTvalue(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
-         profDataPtr->dof = computeDOF(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
-         mutexLock.unlock();
+         entry->addCPUTime(cpuTime);
+         entry->dump();
+         // update the model
+         updateCPUPredictor(parallelCount, entry->getCPUMean());
 
-         TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] GPU ProfilingStorage Updated (range: %d, time: %.4f msec) -> (average CPU time: %.3f msec, average GPU time: %.3f, t_value=%.3f, dof=%.3f)", parallelCount, gpuTime, profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->t_value, profDataPtr->dof);
-        // update the model
-#ifdef PROFILING_DO_PREDICT
-         updatePredictor(gpuPredictor, parallelCount, profDataPtr->gpuMean);
-#endif
+         mutexLock.unlock();
          }
       else
          {
@@ -995,41 +1186,26 @@ public:
          }
       }
 
-   // Update the CPU timings
-   void updateCPUEntry(int parallelCount, double cpuTime)
+   // Update the GPU timings
+   void updateGPUEntry(int parallelCount, double gpuTime)
       {
-       mutexLock.lock();
-       ProfilingStorageEntry* profDataPtr = getOrAllocEntry(parallelCount);
-       if (profDataPtr != NULL)
-          {
-          // update average cpu time
-          double n = profDataPtr->numCPUSamplesObserved + 1;
-          double m = profDataPtr->cpuMean;
-          double s = profDataPtr->cpuSampleVariance;
-          double x = cpuTime;
-
-          // update the average iteratively
-          profDataPtr->cpuMean = ((n-1) * m + x) / n;
-          profDataPtr->cpuSampleVariance = (n == 1)? 0 : (((n-2) * s ) / (n-1)) + (x - m) * (x - m) / n;
-          profDataPtr->cpuSampleStddev = sqrt(profDataPtr->cpuSampleVariance);
-          profDataPtr->numCPUSamplesObserved++;
-
-          //
-          profDataPtr->t_value = computeTvalue(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
-          profDataPtr->dof = computeDOF(profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->cpuSampleVariance, profDataPtr->gpuSampleVariance, profDataPtr->numCPUSamplesObserved, profDataPtr->numGPUSamplesObserved);
-          mutexLock.unlock();
-
-          TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] CPU ProfilingStorage Updated (range: %d, time: %.4f msec) -> (average CPU time: %.3f msec, average GPU time: %.3f, t_value=%.3f, dof=%.3f)", parallelCount, cpuTime, profDataPtr->cpuMean, profDataPtr->gpuMean, profDataPtr->t_value, profDataPtr->dof);
-          // update the model
-#ifdef PROFILING_DO_PREDICT
-            updatePredictor(cpuPredictor, parallelCount, profDataPtr->cpuMean);
-#endif
-          }
-       else
-          {
-          // TODO: error handling
-          mutexLock.unlock();
-          }
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Updating GPU ProfilingStorage entry (range: %d, time: %.4f msec)", parallelCount, gpuTime);
+      mutexLock.lock();
+      ProfilingStorageEntry* entry = getOrAllocEntry(parallelCount);
+      if (entry != NULL)
+         {
+         //
+         entry->addGPUTime(gpuTime);
+         entry->dump();
+         // update the model
+         updateGPUPredictor(parallelCount, entry->getGPUMean());
+         mutexLock.unlock();
+         }
+      else
+         {
+         // TODO: error handling
+         mutexLock.unlock();
+         }
       }
 
    // return true if the given parallelCount is in the storage.
@@ -1039,18 +1215,34 @@ public:
       }
 
   // return true if we can say the performance prediciton is accurate enough.
-  bool isPredictorAccurate(int parallelCount)
+  bool isPredictorAccurate()
      {
-     return false;
+     return (cpuR2value >= 0.9 && gpuR2value >= 0.9);
      }
 
    // return true if we're pretty sure that the GPU version is faster.
    bool gpuIsFaster(int parallelCount, int numArrays, int H2D1, int H2D2, int H2D3, int H2D4, int H2D5, int D2H1, int D2H2, int D2H3, int D2H4, int D2H5)
       {
-      return false;
+      ProfilingStorageEntry *entry = getEntry(parallelCount);
+      if (entry)
+         {
+            if (entry->decision == Selection::gpu)
+               {
+               return true;
+               }
+            else
+               {
+               return false;
+               }
+         }
+      else
+         {
+         return false;
+         }
       }
 
 private:
+
    ProfilingStorageEntry* getOrAllocEntry(int parallelCount)
       {
       int32_t i = 0;
@@ -1083,36 +1275,90 @@ private:
       return NULL;
       }
 
-   double computeTvalue(double uc, double ug, double sc2, double sg2, int nc, int ng) {
-      return (uc - ug) / sqrt(sc2/(double)nc + sg2/(double)ng);
-   }
-
-   double computeDOF(double uc, double ug, double sc2, double sg2, int nc, int ng) {
-      double tmp = sc2/(double)nc + sg2/(double)ng;
-      return (tmp*tmp) / ((sc2*sc2) / (nc*nc*(nc-1)) + (sg2*sg2) / (ng*ng*(ng-1)));
-   }
-
-#ifdef PROFILING_DO_PREDICT
-   void updatePredictor(orlib::Regressor<double> *predictor, int parallelCount, double time)
+   double computeR2Value(bool isCPU)
       {
+      int32_t i = 0;
+      double y_mean = 0.0;
+      int count = 0;
+      // compute y_mean first
+      for (; i < NUM_PROF_SAMPLES; i++)
+         {
+         if (profileStorage[i].parallelCount != -1)
+            {
+            ProfilingStorageEntry *p = &profileStorage[i];
+            count++;
+            if (isCPU)
+               y_mean += p->getCPUMean();
+            else
+               y_mean += p->getGPUMean();
+            }
+         }
+      y_mean /= count;
+
+      // compute rss and tss
+      double residual_sum_of_squares = 0.0;
+      double total_sum_of_squares = 0.0;
+      for (; i < NUM_PROF_SAMPLES; i++)
+         {
+         if (profileStorage[i].parallelCount != -1)
+            {
+            ProfilingStorageEntry *p = &profileStorage[i];
+            double tmp, tmp2;
+            if (isCPU)
+               {
+               tmp = (p->getCPUMean() - cpuPredictor->predict(p->parallelCount));
+               tmp2 = (p->getCPUMean() - y_mean);
+               }
+            else
+               {
+               tmp = (p->getGPUMean() - gpuPredictor->predict(p->parallelCount));
+               tmp2 = (p->getGPUMean() - y_mean);
+               }
+
+            residual_sum_of_squares += tmp * tmp;
+            total_sum_of_squares += tmp2 * tmp2;
+            }
+         }
+      return 1.0 - total_sum_of_squares / residual_sum_of_squares;
+      }
+
+   void updateCPUPredictor(int parallelCount, double time)
+      {
+      // update weight vector
       double startTime, endTime;
       startTime = currentTime();
-      orlib::Vector<double> feature(1);
-      feature[0] = parallelCount;
-      predictor->train(feature, time);
+      cpuPredictor->train(parallelCount, time);
+
+      // update R^2-statistics
+      cpuR2value = computeR2Value(true);
       endTime = currentTime();
-#ifdef PROFILING_LOWLEVEL_DEBUG
-      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] %s Regressor Updated: %.3f msec", (predictor == cpuPredictor)? "CPU" : "GPU", (endTime-startTime)/1000);
-#endif
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] CPU Regressor Updated: %.3f msec, r2 = %.3f", (endTime-startTime)/1000, cpuR2value);
+      cpuPredictor->dump();
       }
-#endif
+
+   void updateGPUPredictor(int parallelCount, double time)
+      {
+      // update weight vector
+      double startTime, endTime;
+      startTime = currentTime();
+      gpuPredictor->train(parallelCount, time);
+
+      // update R^2-statistics
+      gpuR2value = computeR2Value(false);
+      endTime = currentTime();
+      TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] GPU Regressor Updated: %.3f msec, r2 = %.3f", (endTime-startTime)/1000, gpuR2value);
+      gpuPredictor->dump();
+      }
 
    // private fields
    ProfilingStorageEntry profileStorage[NUM_PROF_SAMPLES];
-#ifdef PROFILING_DO_PREDICT
-   orlib::Regressor<double> *cpuPredictor;
-   orlib::Regressor<double> *gpuPredictor;
-#endif
+
+   // for prediction
+   PARegressor<double> *cpuPredictor;
+   PARegressor<double> *gpuPredictor;
+   double cpuR2value;
+   double gpuR2value;
+
    GPUExecutionMode::executionMode execMode;
    std::mutex mutexLock;
 };
@@ -2179,72 +2425,61 @@ int scheduleGPU(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC, int range)
       {
       // See if there are any finished kernels with the profiler enabled
       if (profileTable)
-          {
-          // Get one entry
-          GPUProfilingTableEntry *profileTableEntry = profileTable->getEntry(kernelId);
-          float elapsedGPUTime = 0.0f;
-          float elapsedOverheadTime = 0.0f;
-          bool newSampleAdded = false;
-          while (profileTableEntry)
-             {
-             newSampleAdded = true;
-             jitCudaEventElapsedTime(&elapsedGPUTime, profileTableEntry->start, profileTableEntry->end);
+         {
+         // Get one entry
+         GPUProfilingTableEntry *profileTableEntry = profileTable->getEntry(kernelId);
+         float elapsedGPUTime = 0.0f;
+         float elapsedOverheadTime = 0.0f;
+         while (profileTableEntry)
+            {
+            jitCudaEventElapsedTime(&elapsedGPUTime, profileTableEntry->start, profileTableEntry->end);
 #ifdef PROFILING_LOWLEVEL_DEBUG
-             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Adding a new GPU time entry @ estimateGPU(): time:%.3f msec", kernelId, elapsedGPUTime);
+            TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Adding a new GPU time entry @ estimateGPU(): time:%.3f msec", kernelId, elapsedGPUTime);
 #endif
-             profileData = getOrAllocProfileHashTable(gpuMetaData, kernelId);
-             // Update mean GPU time in the profiling storage
-             profileData->updateGPUEntry(range, elapsedGPUTime);
+            profileData = getOrAllocProfileHashTable(gpuMetaData, kernelId);
+            // Update mean GPU time in the profiling storage
+            profileData->updateGPUEntry(range, elapsedGPUTime);
 #ifdef PROFILING_LOWLEVEL_DEBUG
-             // Only for overhead analysis purpose
-             jitCudaEventElapsedTime(&elapsedOverheadTime, profileTableEntry->end, profileTableEntry->finish);
-             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Callback overhead was %.3f msec", elapsedOverheadTime);
+            // Only for overhead analysis purpose
+            jitCudaEventElapsedTime(&elapsedOverheadTime, profileTableEntry->end, profileTableEntry->finish);
+            TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Callback overhead was %.3f msec", elapsedOverheadTime);
 #endif
-             // Remove the entry from the profiling table
-             profileTable->removeEntry(profileTableEntry);
-             // Look for the next entry
-             profileTableEntry = profileTable->getEntry(kernelId);
-             }
-          if (newSampleAdded)
-             {
-             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Trying to see if we can exit from the profling mode (range %d)" , kernelId, range);
-		     GPUExecutionMode::executionMode nextState = profileData->getNextExeMode(range);
-             if (nextState == GPUExecutionMode::normal)
-                {
-                TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Transition : PROFILING->NORMAL", kernelId);
-                TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Transition : Invalidating GPU data", kernelId);
-                cudaInfo->exeMode = GPUExecutionMode::normal;
-                // invalidate
-                for (int32_t i = 0; i < cudaInfo->hashSize; i++)
-                   {
-                   if (cudaInfo->hashTable[i].hostRef != 0
-                       && cudaInfo->hashTable[i].hostRef != (void **)DELETED_HOSTREF
-                       && cudaInfo->hashTable[i].deviceArray != NULL_DEVICE_PTR
-                       && cudaInfo->hashTable[i].deviceArray != BAD_DEVICE_PTR
-                       && cudaInfo->hashTable[i].valid)
-                      {
-                      cudaInfo->hashTable[i].valid = false; // invalidate GPU data
-                      }
-                   }
-                }
-             else
-                {
-                TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Continue PROFILING", kernelId);
-                return 0; // Run GPU with Profiling Enabled
-                }
-             }
-          else
-             {
-             // There is profiling data, but no new sample
-             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] No new GPU profiling sample found ", kernelId);
-             return 0;
-             }
-          }
+            // Remove the entry from the profiling table
+            profileTable->removeEntry(profileTableEntry);
+            // Look for the next entry
+            profileTableEntry = profileTable->getEntry(kernelId);
+            }
+         TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Trying to see if we can exit from the profling mode (range %d)" , kernelId, range);
+		 GPUExecutionMode::executionMode nextState = profileData->getNextExeMode(range);
+         if (nextState == GPUExecutionMode::normal)
+            {
+            TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Transition : PROFILING->NORMAL", kernelId);
+            TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Transition : Invalidating GPU data", kernelId);
+            cudaInfo->exeMode = GPUExecutionMode::normal;
+            // invalidate
+            for (int32_t i = 0; i < cudaInfo->hashSize; i++)
+               {
+               if (cudaInfo->hashTable[i].hostRef != 0
+                   && cudaInfo->hashTable[i].hostRef != (void **)DELETED_HOSTREF
+                   && cudaInfo->hashTable[i].deviceArray != NULL_DEVICE_PTR
+                   && cudaInfo->hashTable[i].deviceArray != BAD_DEVICE_PTR
+                   && cudaInfo->hashTable[i].valid)
+                  {
+                  cudaInfo->hashTable[i].valid = false; // invalidate GPU data
+                  }
+               }
+            }
+         else
+            {
+            TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Continue PROFILING", kernelId);
+            return 0; // Run GPU with Profiling Enabled
+            }
+         }
       else
-          {
-          // There is no GPU profiling data (profileTable)
-          return 0; // Run GPU with Profiling Enabled
-          }
+         {
+         // There is no GPU profiling data (profileTable)
+         return 0; // Run GPU with Profiling Enabled
+         }
       }
 
    if (cudaInfo->exeMode == GPUExecutionMode::normal)
@@ -2261,6 +2496,9 @@ int scheduleGPU(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC, int range)
          return 1; // CPU
          }
       }
+
+   // CPU
+   return 1;
    }
 #endif
 
@@ -3073,6 +3311,7 @@ registerCPUTime(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC)
           // since we plan to profile D2H transfers,
           // comment out this for now.
           // return freeGPUScope(cudaInfo);
+      return true;
       }
    else
       {
