@@ -2483,11 +2483,7 @@ launchKernel(int tracing, CudaInfo *cudaInfo, int gridDimX, int gridDimY, int gr
 
 // GPU helpers (called from generated code)
 
-#ifndef ENABLE_GPU_PROFILING
 int flushGPUDatatoCPU(CudaInfo *cudaInfo);
-#else
-int flushGPUDatatoCPU(CudaInfo *cudaInfo, uint8_t *startPC);
-#endif
 bool freeGPUScope(CudaInfo *cudaInfo);
 
 #ifdef ENABLE_GPU_PROFILING
@@ -2664,11 +2660,7 @@ estimateGPU(CudaInfo *cudaInfo, int ptxSourceID, uint8_t *startPC, int lambdaCos
          freeGPUScope(cudaInfo);
          break;
       case TR::CodeGenerator::naturalLoopScope:
-#ifndef ENABLE_GPU_PROFILING
          flushGPUDatatoCPU(cudaInfo);
-#else
-         flushGPUDatatoCPU(cudaInfo, startPC);
-#endif
          break;
       }
             
