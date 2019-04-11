@@ -734,6 +734,8 @@ struct HashEntry
 /////////////////////////////////////////////////////////////////////////////////////
 #ifdef ENABLE_GPU_PROFILING
 
+#undef PROFILING_LOWLEVEL_DEBUG
+
 // To acuire and release locks
 #include <mutex>
 
@@ -839,22 +841,11 @@ public:
    GPUProfilingTableEntry* getEntry()
       {
       GPUProfilingTableEntry* curr = dummy_head.next;
-#if 0
-      while (curr != NULL)
-         {
-         if (curr->kernelID == kernelID)
-            {
-            return curr;
-            }
-         curr = curr->next;
-         }
-      return NULL;
-#endif
       return curr;
       }
 
    // For debugging purpose
-    //#ifdef PROFILING_LOWLEVEL_DEBUG
+#ifdef PROFILING_LOWLEVEL_DEBUG
    void printGPUProfilingTable()
       {
       TR_VerboseLog::writeLine(TR_Vlog_GPU, "\tPrinting GPUProfilingTable: current_head = 0x%x", current_head);
@@ -870,7 +861,7 @@ public:
          curr = curr->next;
          }
       }
-    //#endif
+#endif
 
 private:
     GPUProfilingTableEntry dummy_head;
@@ -1155,13 +1146,19 @@ public:
 
    void initPredictors()
       {
-      void* cpuRegressorMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(PARegressor<double>), TR_Memory::GPUHelpers);
-      void* gpuRegressorMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(PARegressor<double>), TR_Memory::GPUHelpers);
+      cpuRegressorMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(PARegressor<double>), TR_Memory::GPUHelpers);
+      gpuRegressorMem = (void*)TR_Memory::jitPersistentAlloc(sizeof(PARegressor<double>), TR_Memory::GPUHelpers);
       cpuPredictor = new ((PARegressor<double>*)cpuRegressorMem)PARegressor<double>();
       gpuPredictor = new ((PARegressor<double>*)gpuRegressorMem)PARegressor<double>();
       TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Regressor Algorithm : Passive Aggressive");
       cpuR2value = 0.0;
       gpuR2value = 0.0;
+      }
+
+    void deletePredictors()
+      {
+      TR_Memory::jitPersistentFree(cpuRegressorMem);
+      TR_Memory::jitPersistentFree(gpuRegressorMem);
       }
 
    GPUExecutionMode::executionMode getCurrentExeMode()
@@ -1231,6 +1228,8 @@ public:
    // Update the GPU timings
    void updateGPUEntry(int parallelCount, double gpuTime)
       {
+      // The current implementation registers the overall GPU execution time 
+      // (including alloc, h2d, kernel, d2h)
       TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Updating GPU ProfilingStorage entry (range: %d, time: %.4f msec)", parallelCount, gpuTime);
       mutexLock.lock();
       ProfilingStorageEntry* entry = getOrAllocEntry(parallelCount);
@@ -1238,7 +1237,6 @@ public:
          {
          //
          entry->addGPUTime(gpuTime);
-         entry->dump();
          // update the model
          updateGPUPredictor(parallelCount, entry->getGPUMean());
          mutexLock.unlock();
@@ -1400,6 +1398,8 @@ private:
    PARegressor<double> *gpuPredictor;
    double cpuR2value;
    double gpuR2value;
+   void* cpuRegressorMem;
+   void* gpuRegressorMem;
 
    GPUExecutionMode::executionMode execMode;
    std::mutex mutexLock;
@@ -1448,8 +1448,9 @@ static GPUProfilingTable* getGPUProfilingTableViaCudaInfo (CudaInfo *cudaInfo);
 GPUProfilingTableEntry* startAPIProfiling(CudaInfo *cudaInfo, CUDAAPI::kind kind, int size, int kernelID, cudaStream_t stream)
    {
    if (!cudaInfo) return NULL;
-
+#ifdef PROFILING_LOWLEVEL_DEBUG
    TR_VerboseLog::writeLine(TR_Vlog_GPU,"\tStart API Profiling CudaInfo (%p)", cudaInfo);
+#endif
    GPUProfilingTableEntry* entry = (GPUProfilingTableEntry*) TR_Memory::jitPersistentAlloc(sizeof(GPUProfilingTableEntry), TR_Memory::GPUHelpers);
    entry->kind = kind;
    entry->kernelID = kernelID;
@@ -1542,7 +1543,7 @@ public:
    double             cpuTime;
    double             gpuTime;
    int                profileKey;
-   int                profilingSafe;
+   int                lazyProfilingSafe;
    ProfilingHashTable*  profileData;
    GPUProfilingTable* gpuProfiler;
    // for state transitions between normal and profiling mode
@@ -2500,10 +2501,13 @@ int scheduleGPU(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC, int range)
    GpuMetaData* gpuMetaData = getGPUMetaData(startPC);
 
    cudaInfo->profileKey  = range;
-   //cudaInfo->profilingSafe = isProfilingSafe;
-   cudaInfo->profilingSafe = true;
+   cudaInfo->lazyProfilingSafe = true;
 
+   // profileTable stores GPU timing information (alloc, h2d, kernel, d2h)
+   // This info is per kernel (= cudaInfo)
    GPUProfilingTable* profileTable = getGPUProfilingTableViaCudaInfo(cudaInfo);
+   // profileData is essentially a key-value store plus regression models
+   // (loopSize -> CPUcost, loopSize->GPUcost)
    ProfilingHashTable* profileData = getProfileHashTable(gpuMetaData, kernelId);
 
    // Moving to profiling mode if there is no profiling data
@@ -2521,30 +2525,32 @@ int scheduleGPU(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC, int range)
 
    if (cudaInfo->exeMode == GPUExecutionMode::profiling)
       {
-      // See if there are any finished kernels with the profiler enabled
+      // See if there are any finished activities with the profiler enabled
       if (profileTable)
          {
          float elapsedGPUTime = 0.0f;
          float elapsedOverheadTime = 0.0f;
-
+#ifdef PROFILING_LOWLEVEL_DEBUG
          profileTable->printGPUProfilingTable();
-
-         // Accumulate Get alloc/dt costs
+#endif
+         // For Accumulating alloc, h2d, kernel, and d2h costs
          double cummulativeTime = 0.0f;
          // Get one entry
          GPUProfilingTableEntry *profileTableEntry = profileTable->getEntry();
          while (profileTableEntry)
             {
-            profileData = getOrAllocProfileHashTable(gpuMetaData, kernelId);
             // Update mean GPU time in the profiling storage
             if (profileTableEntry->kind != CUDAAPI::alloc)
                {
                jitCudaEventElapsedTime(&elapsedGPUTime, profileTableEntry->start, profileTableEntry->end);
                cummulativeTime += elapsedGPUTime;
 #ifdef PROFILING_LOWLEVEL_DEBUG
-            // Only for overhead analysis purpose
-            jitCudaEventElapsedTime(&elapsedOverheadTime, profileTableEntry->end, profileTableEntry->finish);
-            TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Callback overhead was %.3f msec", elapsedOverheadTime);
+               // Only for overhead analysis purpose
+               if (profileTableEntry->kind == CUDAAPI::kernel)
+                  {
+                  jitCudaEventElapsedTime(&elapsedOverheadTime, profileTableEntry->end, profileTableEntry->finish);
+                  TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Callback overhead was %.3f msec", elapsedOverheadTime);
+                  }
 #endif
                }
             else
@@ -2556,10 +2562,14 @@ int scheduleGPU(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC, int range)
             // Look for the next entry
             profileTableEntry = profileTable->getEntry();
             }
+         if (cummulativeTime > 0) 
+            {
 #ifdef PROFILING_LOWLEVEL_DEBUG
             TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Adding a new GPU time entry @ estimateGPU(): time:%.3f msec", kernelId, cummulativeTime);
 #endif
-         if (cummulativeTime > 0) profileData->updateGPUEntry(range, cummulativeTime);
+            profileData = getOrAllocProfileHashTable(gpuMetaData, kernelId);
+            profileData->updateGPUEntry(range, cummulativeTime);
+            }
 
          TR_VerboseLog::writeLine(TR_Vlog_GPU, "[Profiling] Kernel ID%d Trying to see if we can exit from the profling mode (range %d)" , kernelId, range);
 		 GPUExecutionMode::executionMode nextState = profileData->getNextExeMode(range);
@@ -2641,7 +2651,10 @@ estimateGPU(CudaInfo *cudaInfo, int ptxSourceID, uint8_t *startPC, int lambdaCos
       }
 
 #ifdef ENABLE_GPU_PROFILING
-   return scheduleGPU(cudaInfo, ptxSourceID, startPC, range);
+   //   if (TR::Options::getCmdLineOptions()->getEnableGPU(TR_EnableGPUProfile))
+      {
+      return scheduleGPU(cudaInfo, ptxSourceID, startPC, range);
+      }
 #endif
 
    bool directToCPU = ((cudaInfo->availableMemory < (unsigned long long)dataSize) || lambdaCost == 0 || dataCost/range > 80 || range < 1024);
@@ -3461,7 +3474,7 @@ registerCPUTime(CudaInfo *cudaInfo, int kernelId, uint8_t *startPC)
    ProfilingHashTable* profileData = getProfileHashTable(gpuMetaData, kernelId);
 
    double cpuTimeMeasure = (currentTime() - cudaInfo->cpuTime)/1000;
-   profileData->updateCPUEntry(cudaInfo->profileKey,cpuTimeMeasure);
+   profileData->updateCPUEntry(cudaInfo->profileKey, cpuTimeMeasure);
 
    // releasing resources now since we're in profiling mode
    //  and resource release was delayed until after profiling
